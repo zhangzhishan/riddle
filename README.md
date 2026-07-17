@@ -35,8 +35,7 @@ be installed):
 Copy `oracle.env.example` to `oracle.env` inside
 `.adds/riddle-kobo/`, configure a vision-capable OpenAI-compatible endpoint,
 then safely eject. Launch **Riddle Diary** from NickelMenu. To exit, press the
-Stylus 2 eraser and side button together. The separate **Restore Kobo UI** menu
-item runs the emergency Nickel resume script.
+Stylus 2 eraser and side button together.
 
 Before the first real launch, collect an exact device report over SSH/telnet:
 
@@ -45,12 +44,13 @@ Before the first real launch, collect an exact device report over SSH/telnet:
   >/mnt/onboard/riddle-kobo-probe.txt 2>&1
 ```
 
-The launcher never kills Nickel: it sends SIGSTOP immediately before riddle
-starts and SIGCONT from a shell trap on every normal/error exit. If needed over
-SSH, recover with:
+The launcher captures the exact framebuffer bpp/grayscale/native rotation,
+terminates Nickel, and runs riddle in canonical portrait Gray8. On every normal
+or crash exit, its parent shell restores the saved mode before restarting a
+fresh Nickel process. If the launcher itself is force-killed, recover over SSH:
 
 ```sh
-killall -CONT nickel hindenburg sickel
+/mnt/onboard/.adds/riddle-kobo/restore-nickel.sh
 ```
 
 The Kobo artifact statically links FBInk (GPLv3+), so distributed Kobo binaries

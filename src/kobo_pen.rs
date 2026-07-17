@@ -16,6 +16,7 @@ const EV_SYN: u16 = 0;
 const EV_KEY: u16 = 1;
 const EV_ABS: u16 = 3;
 const SYN_REPORT: u16 = 0;
+const SYN_DROPPED: u16 = 3;
 const BTN_TOUCH: u16 = 330;
 const BTN_STYLUS: u16 = 331;
 const BTN_STYLUS2: u16 = 332;
@@ -118,10 +119,10 @@ struct Parser {
     axes: Axes,
     slots: [Slot; MAX_SLOTS],
     current: usize,
-    btn_touch: bool,
     eraser: bool,
     second_button: bool,
     quit_requested: bool,
+    dropping: bool,
     pen_was_present: bool,
     last_x: i32,
     last_y: i32,
@@ -133,10 +134,10 @@ impl Parser {
             axes,
             slots: [Slot::default(); MAX_SLOTS],
             current: 0,
-            btn_touch: false,
             eraser: false,
             second_button: false,
             quit_requested: false,
+            dropping: false,
             pen_was_present: false,
             last_x: 0,
             last_y: 0,
@@ -144,6 +145,17 @@ impl Parser {
     }
 
     fn feed(&mut self, kind: u16, code: u16, value: i32, out: &mut Vec<PenSample>) {
+        if self.dropping {
+            if kind == EV_SYN && code == SYN_REPORT {
+                self.dropping = false;
+            }
+            return;
+        }
+        if kind == EV_SYN && code == SYN_DROPPED {
+            self.reset_after_drop(out);
+            self.dropping = true;
+            return;
+        }
         match (kind, code) {
             (EV_ABS, ABS_MT_SLOT) => self.current = (value.max(0) as usize).min(MAX_SLOTS - 1),
             (EV_ABS, ABS_MT_TRACKING_ID) => {
@@ -170,12 +182,30 @@ impl Parser {
                 self.slots[self.current].pressure = value;
                 self.slots[self.current].dirty = true;
             }
-            (EV_KEY, BTN_TOUCH) => self.btn_touch = value != 0,
+            (EV_KEY, BTN_TOUCH) => {}
             (EV_KEY, BTN_STYLUS) => self.eraser = value != 0,
             (EV_KEY, BTN_STYLUS2) => self.second_button = value != 0,
             (EV_SYN, SYN_REPORT) => self.finish_frame(out),
             _ => {}
         }
+    }
+
+    fn reset_after_drop(&mut self, out: &mut Vec<PenSample>) {
+        if self.pen_was_present {
+            out.push(PenSample {
+                x: self.last_x,
+                y: self.last_y,
+                pressure: 0,
+                tool: Tool::Pen,
+                touching: false,
+                proximity: false,
+            });
+        }
+        self.slots = [Slot::default(); MAX_SLOTS];
+        self.current = 0;
+        self.eraser = false;
+        self.second_button = false;
+        self.pen_was_present = false;
     }
 
     fn finish_frame(&mut self, out: &mut Vec<PenSample>) {
@@ -195,7 +225,10 @@ impl Parser {
                 .pressure
                 .scale(slot.pressure, MAX_PRESSURE + 1, false)
                 .clamp(0, MAX_PRESSURE);
-            let touching = pressure > 0 || self.btn_touch;
+            // Condor multiplexes finger and pen slots. BTN_TOUCH is global, so
+            // using it here would turn a hovering pen into a stroke whenever a
+            // palm or finger is also down. Pen contact is per-slot pressure.
+            let touching = pressure > 0;
             if slot.dirty || !self.pen_was_present {
                 out.push(PenSample {
                     x,
@@ -396,6 +429,52 @@ mod tests {
         assert!(pen[0].y > SCREEN_H as i32 / 2, "Y should be mirrored");
         assert!(pen[0].touching);
         assert_eq!(pen[0].tool, Tool::Pen);
+    }
+
+    #[test]
+    fn palm_touch_does_not_turn_pen_hover_into_ink() {
+        let mut p = parser();
+        let samples = frame(
+            &mut p,
+            &[
+                (EV_KEY, BTN_TOUCH, 1),
+                (EV_ABS, ABS_MT_SLOT, 1),
+                (EV_ABS, ABS_MT_TRACKING_ID, 11),
+                (EV_ABS, ABS_MT_TOOL_TYPE, MT_TOOL_PEN),
+                (EV_ABS, ABS_MT_POSITION_X, 500),
+                (EV_ABS, ABS_MT_POSITION_Y, 500),
+                (EV_ABS, ABS_MT_PRESSURE, 0),
+            ],
+        );
+        assert_eq!(samples.len(), 1);
+        assert!(samples[0].proximity);
+        assert!(!samples[0].touching);
+    }
+
+    #[test]
+    fn syn_dropped_forces_pen_up_and_discards_partial_frame() {
+        let mut p = parser();
+        let down = frame(
+            &mut p,
+            &[
+                (EV_ABS, ABS_MT_SLOT, 1),
+                (EV_ABS, ABS_MT_TRACKING_ID, 11),
+                (EV_ABS, ABS_MT_TOOL_TYPE, MT_TOOL_PEN),
+                (EV_ABS, ABS_MT_POSITION_X, 500),
+                (EV_ABS, ABS_MT_POSITION_Y, 500),
+                (EV_ABS, ABS_MT_PRESSURE, 2048),
+            ],
+        );
+        assert!(down[0].touching);
+
+        let mut out = Vec::new();
+        p.feed(EV_SYN, SYN_DROPPED, 0, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].touching);
+        assert!(!out[0].proximity);
+        p.feed(EV_ABS, ABS_MT_PRESSURE, 4095, &mut out);
+        p.feed(EV_SYN, SYN_REPORT, 0, &mut out);
+        assert_eq!(out.len(), 1, "partial dropped frame must be ignored");
     }
 
     #[test]

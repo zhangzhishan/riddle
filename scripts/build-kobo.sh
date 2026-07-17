@@ -44,6 +44,11 @@ install -m 644 "$ROOT/kobo/nm/riddle-kobo" "$DIST/.adds/nm/riddle-kobo"
     zip -qry "$ROOT/dist/riddle-kobo.zip" .
 )
 
-file "$DIST/.adds/riddle-kobo/riddle"
+FILE_INFO=$(file "$DIST/.adds/riddle-kobo/riddle")
+printf '%s\n' "$FILE_INFO"
+case "$FILE_INFO" in
+    *"ELF 32-bit"*ARM*"statically linked"*) ;;
+    *) echo "Unexpected Kobo binary format: $FILE_INFO" >&2; exit 1 ;;
+esac
 echo "Bundle: $DIST"
 echo "Archive: $ROOT/dist/riddle-kobo.zip"

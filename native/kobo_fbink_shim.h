@@ -22,6 +22,13 @@ typedef struct {
     char device_codename[32];
 } riddle_kobo_fb_info;
 
+typedef struct {
+    uint8_t bpp;
+    uint8_t grayscale;
+    uint16_t reserved;
+    uint32_t rotation;
+} riddle_kobo_fb_state;
+
 enum {
     RIDDLE_KOBO_REFRESH_FAST = 0,
     RIDDLE_KOBO_REFRESH_BALANCED = 1,
@@ -29,6 +36,8 @@ enum {
 };
 
 riddle_kobo_fb *riddle_kobo_fb_open(riddle_kobo_fb_info *info, char *error, size_t error_len);
+int riddle_kobo_fb_capture_state(riddle_kobo_fb_state *state, char *error, size_t error_len);
+int riddle_kobo_fb_restore_state(const riddle_kobo_fb_state *state, char *error, size_t error_len);
 int riddle_kobo_fb_refresh(riddle_kobo_fb *fb, uint32_t x, uint32_t y,
                            uint32_t width, uint32_t height, int mode);
 void riddle_kobo_fb_close(riddle_kobo_fb *fb);

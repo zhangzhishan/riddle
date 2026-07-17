@@ -239,6 +239,20 @@ mod tests {
     }
 
     #[test]
+    fn gray8_respects_padded_stride() {
+        let (w, h, stride) = (5, 3, 8);
+        let mut buf = vec![0xAA; stride * h];
+        let mut surface = Surface::new(buf.as_mut_ptr(), buf.len(), w, h, stride, PixFmt::Gray8);
+        surface.fill_rect(0, 0, w, h, WHITE);
+        surface.put_px(4, 2, BLACK);
+        assert_eq!(buf[2 * stride + 4], 0);
+        assert!(buf.iter().enumerate().all(|(i, &v)| {
+            let column = i % stride;
+            column < w || v == 0xAA
+        }));
+    }
+
+    #[test]
     fn gray8_copy_and_paste_round_trip() {
         let (_buf, mut surface) = gray_surface(8, 6);
         surface.fill_rect(1, 1, 3, 2, BLACK);

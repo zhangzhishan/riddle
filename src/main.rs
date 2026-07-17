@@ -103,6 +103,25 @@ struct WritePlan {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        #[cfg(all(feature = "kobo", target_os = "linux"))]
+        Some("--kobo-capture-state") => {
+            match kobo_display::capture_state() {
+                Ok(state) => println!("{state}"),
+                Err(error) => {
+                    eprintln!("riddle: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        #[cfg(all(feature = "kobo", target_os = "linux"))]
+        Some("--kobo-restore-state") => {
+            if let Err(error) = kobo_display::restore_state(&args[2..]) {
+                eprintln!("riddle: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         // Diagnostic: run one oracle turn and print the streamed chunks.
         // Lets you verify your endpoint + key + model before ever launching
         // the diary. No display needed.
@@ -197,6 +216,11 @@ fn run() -> std::io::Result<()> {
         surf.stride
     );
 
+    #[cfg(feature = "kobo")]
+    let mut pen_dev = Some(pen::PenDevice::open().map_err(|error| {
+        std::io::Error::new(error.kind(), format!("Kobo stylus is required: {error}"))
+    })?);
+    #[cfg(not(feature = "kobo"))]
     let mut pen_dev = match pen::PenDevice::open() {
         Ok(p) => Some(p),
         Err(e) => {
@@ -436,7 +460,7 @@ fn run() -> std::io::Result<()> {
                         surf.fill_rect(qx as usize, qy as usize, qw as usize, qh as usize, WHITE);
                         disp.update(qx, qy, qw, qh, false);
                         user_ink.clear();
-                        let panel = help::show(&mut surf, &font, takeover);
+                        let panel = help::show(&mut surf, &font, remarkable_controls);
                         let (px, py, pw, ph) = panel.region.rect();
                         disp.update(px, py, pw, ph, false);
                         eprintln!("riddle: guide shown");
@@ -484,7 +508,9 @@ fn run() -> std::io::Result<()> {
                 if Instant::now() >= next {
                     ink::dissolve_pass(&mut surf, region, stage, STAGES);
                     let (x, y, w, h) = region.rect();
-                    disp.update(x, y, w, h, true);
+                    // Dissolve introduces intermediate grays; DU is binary and
+                    // ghosts badly here, while GL16 preserves the fade.
+                    disp.update(x, y, w, h, false);
                     if stage + 1 >= STAGES {
                         user_ink.clear();
                         State::Thinking { rx, pulse: Instant::now(), blot_on: false, since: Instant::now() }
@@ -743,7 +769,7 @@ fn run() -> std::io::Result<()> {
                 if Instant::now() >= next {
                     ink::dissolve_pass(&mut surf, region, stage, STAGES);
                     let (x, y, w, h) = region.rect();
-                    disp.update(x, y, w, h, true);
+                    disp.update(x, y, w, h, false);
                     if stage + 1 >= STAGES {
                         disp.full_refresh(surf.w, surf.h);
                         State::Listening { last_pen: None }
