@@ -14,9 +14,14 @@ ab_glyph = "0.2"
 # OpenSSL/C — keeps the binary self-contained and cross-compiles cleanly.
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
 
+[build-dependencies]
+cc = "1.2"
+
 [features]
 # Link libquill.so (vendor e-ink engine C ABI) for full-takeover mode.
 takeover = []
+# Build the Kobo Elipsa 2E (Condor, Mark 11) device backend.
+kobo = []
 
 [profile.release]
 strip = true

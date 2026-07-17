@@ -1,6 +1,13 @@
 //! Geometry helpers. Drawing lives in surface.rs.
 
+#[cfg(feature = "kobo")]
+pub const SCREEN_W: usize = 1404;
+#[cfg(feature = "kobo")]
+pub const SCREEN_H: usize = 1872;
+
+#[cfg(not(feature = "kobo"))]
 pub const SCREEN_W: usize = 1620;
+#[cfg(not(feature = "kobo"))]
 pub const SCREEN_H: usize = 2160;
 
 /// Grow-only pixel bounding box, used to build update/dissolve regions.

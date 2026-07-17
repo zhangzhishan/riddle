@@ -5,6 +5,8 @@
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PixFmt {
+    /// 1 byte/px grayscale (Kobo/FBInk's preferred fast path).
+    Gray8,
     /// 2 bytes/px, little-endian RGB565 (qtfb FBFMT_RMPP_RGB565).
     Rgb565,
     /// 4 bytes/px, QImage Format_RGB32: bytes B,G,R,0xFF.
@@ -69,6 +71,11 @@ impl Surface {
         }
         let (stride, fmt) = (self.stride, self.fmt);
         match fmt {
+            PixFmt::Gray8 => {
+                let i = y as usize * stride + x as usize;
+                let (_, g, _) = expand565(c);
+                self.buf()[i] = g;
+            }
             PixFmt::Rgb565 => {
                 let i = y as usize * stride + x as usize * 2;
                 let b = self.buf();
@@ -95,6 +102,7 @@ impl Surface {
         }
         let b = self.buf_ref();
         match self.fmt {
+            PixFmt::Gray8 => b[y as usize * self.stride + x as usize],
             PixFmt::Rgb565 => {
                 let i = y as usize * self.stride + x as usize * 2;
                 let px = (b[i] as u16) | ((b[i + 1] as u16) << 8);
@@ -126,6 +134,13 @@ impl Surface {
         let buf = self.buf();
         for row in y..y1 {
             match fmt {
+                PixFmt::Gray8 => {
+                    let s = row * stride + x;
+                    let e = row * stride + x1;
+                    for px in &mut buf[s..e] {
+                        *px = !*px;
+                    }
+                }
                 PixFmt::Rgb565 => {
                     let s = row * stride + x * 2;
                     let e = row * stride + x1 * 2;
@@ -148,6 +163,7 @@ impl Surface {
     #[inline]
     fn bpp(&self) -> usize {
         match self.fmt {
+            PixFmt::Gray8 => 1,
             PixFmt::Rgb565 => 2,
             PixFmt::Rgb32 => 4,
         }
@@ -196,6 +212,43 @@ impl Surface {
             let x = x0 + (x1 - x0) * i / steps;
             let y = y0 + (y1 - y0) * i / steps;
             self.stamp(x, y, r, c);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gray_surface(w: usize, h: usize) -> (Vec<u8>, Surface) {
+        let mut buf = vec![0xFF; w * h];
+        let surface = Surface::new(buf.as_mut_ptr(), buf.len(), w, h, w, PixFmt::Gray8);
+        (buf, surface)
+    }
+
+    #[test]
+    fn gray8_draw_luma_and_invert() {
+        let (buf, mut surface) = gray_surface(8, 6);
+        surface.put_px(2, 3, BLACK);
+        assert_eq!(surface.luma(2, 3), 0);
+        surface.put_px(3, 3, FADED);
+        assert!(surface.luma(3, 3) > 100 && surface.luma(3, 3) < 160);
+        surface.invert_rect(2, 3, 2, 1);
+        assert_eq!(surface.luma(2, 3), 255);
+        assert_eq!(buf.len(), 48);
+    }
+
+    #[test]
+    fn gray8_copy_and_paste_round_trip() {
+        let (_buf, mut surface) = gray_surface(8, 6);
+        surface.fill_rect(1, 1, 3, 2, BLACK);
+        let saved = surface.copy_rect(1, 1, 3, 2);
+        surface.fill_rect(1, 1, 3, 2, WHITE);
+        surface.paste_rect(1, 1, 3, 2, &saved);
+        for y in 1..3 {
+            for x in 1..4 {
+                assert_eq!(surface.luma(x, y), 0);
+            }
         }
     }
 }

@@ -11,8 +11,14 @@ mod display;
 mod fb;
 mod help;
 mod ink;
+#[cfg(all(feature = "kobo", target_os = "linux"))]
+mod kobo_display;
 mod memory;
 mod oracle;
+#[cfg(not(feature = "kobo"))]
+mod pen;
+#[cfg(feature = "kobo")]
+#[path = "kobo_pen.rs"]
 mod pen;
 mod power;
 mod qtfb;
@@ -182,7 +188,7 @@ fn run() -> std::io::Result<()> {
     let font = FontRef::try_from_slice(FONT_TTF).map_err(std::io::Error::other)?;
 
     let (disp, mut surf) = display::Display::open()?;
-    let takeover = matches!(disp, display::Display::Quill);
+    let takeover = disp.is_takeover();
     eprintln!(
         "riddle: display {} ({}x{} stride {})",
         if takeover { "quill/takeover" } else { "qtfb" },
@@ -198,10 +204,11 @@ fn run() -> std::io::Result<()> {
             None
         }
     };
-    // Takeover mode: touch is ours too; 5-finger tap = quit.
-    let mut touch_dev = if takeover { touch::TouchDevice::open().ok() } else { None };
-    // Takeover mode: the power button is ours too (sleep page + suspend).
-    let mut power_dev = if takeover {
+    // reMarkable takeover owns separate touch and power devices. Condor
+    // multiplexes pen + touch on one FD, already grabbed by Kobo PenDevice.
+    let remarkable_controls = takeover && !cfg!(feature = "kobo");
+    let mut touch_dev = if remarkable_controls { touch::TouchDevice::open().ok() } else { None };
+    let mut power_dev = if remarkable_controls {
         power::PowerButton::open().map_err(|e| eprintln!("riddle: no power button ({e})")).ok()
     } else {
         None
@@ -358,6 +365,11 @@ fn run() -> std::io::Result<()> {
                     }
                     _ => {}
                 }
+            }
+            #[cfg(feature = "kobo")]
+            if pdev.take_quit_requested() {
+                eprintln!("riddle: Kobo stylus-button quit");
+                break;
             }
         }
 
