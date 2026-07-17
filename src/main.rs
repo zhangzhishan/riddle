@@ -13,6 +13,7 @@ mod help;
 mod ink;
 #[cfg(all(feature = "kobo", target_os = "linux"))]
 mod kobo_display;
+mod mailbox_client;
 mod memory;
 mod oracle;
 #[cfg(not(feature = "kobo"))]
@@ -56,6 +57,8 @@ usage:
   riddle --oracle-test [PNG]  run one oracle turn against PNG (default
                               /tmp/riddle-page.png) and print the streamed
                               reply; verifies key + endpoint + model
+  riddle --mailbox-send PNG   upload one PNG to the Paper Plane Mailbox
+  riddle --mailbox-check [ID] poll for the first family reply after ID
   riddle --version            print the version
 
 configuration lives in oracle.env next to the binary — see
@@ -128,6 +131,51 @@ fn main() {
         Some("--oracle-test") => {
             let png = args.get(2).map(String::as_str).unwrap_or(PNG_PATH);
             std::process::exit(oracle_test(png));
+        }
+        Some("--mailbox-send") => {
+            let Some(png) = args.get(2) else {
+                eprintln!("riddle: --mailbox-send requires a PNG path");
+                std::process::exit(2);
+            };
+            let client = mailbox_client::MailboxClient::from_env().unwrap_or_else(|error| {
+                eprintln!("riddle: mailbox configuration: {error}");
+                std::process::exit(1);
+            });
+            match client.send_png(png) {
+                Ok(id) => println!("{id}"),
+                Err(error) => {
+                    eprintln!("riddle: mailbox upload failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        Some("--mailbox-check") => {
+            let after = args
+                .get(2)
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .unwrap_or_else(|_| {
+                    eprintln!("riddle: mailbox reply ID must be a non-negative integer");
+                    std::process::exit(2);
+                })
+                .unwrap_or(0);
+            let client = mailbox_client::MailboxClient::from_env().unwrap_or_else(|error| {
+                eprintln!("riddle: mailbox configuration: {error}");
+                std::process::exit(1);
+            });
+            match client.poll_reply(after) {
+                Ok(Some(reply)) => {
+                    println!("{}", reply.id);
+                    print!("{}", reply.body);
+                }
+                Ok(None) => println!("no reply"),
+                Err(error) => {
+                    eprintln!("riddle: mailbox poll failed: {error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
         }
         Some("--version" | "-V") => {
             println!("riddle {}", env!("CARGO_PKG_VERSION"));
