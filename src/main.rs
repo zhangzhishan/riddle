@@ -13,6 +13,7 @@ mod help;
 mod ink;
 #[cfg(all(feature = "kobo", target_os = "linux"))]
 mod kobo_display;
+mod mailbox;
 mod mailbox_client;
 mod memory;
 mod oracle;
