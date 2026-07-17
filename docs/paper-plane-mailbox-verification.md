@@ -8,8 +8,8 @@ Verified on 2026-07-17 from `/Users/zhishan/code/ian-paper-mailbox`.
   - Result: **43 passed, 0 failed**.
   - Includes deliberate two-tap send, cancellation, clear confirmation, offline upload preservation/retry, inbox polling, UTF-8 protocol handling, and bundled Chinese glyph coverage.
 - `python3 -m unittest -q server/test_mailbox_server.py`
-  - Result: **24 passed, 0 failed**.
-  - Covers SQLite persistence, strict routes, separate family/device authentication, safe cookie exchange, PNG validation and 4 MiB limit, protected images/CSS, HTML escaping, duplicate/oversized replies, 204 polling, and no-store responses.
+  - Result: **27 passed, 0 failed**.
+  - Covers SQLite persistence, strict routes/methods/fragments, separate family/device authentication, safe cookie exchange, PNG validation including malformed duplicate headers, 4 MiB limits, protected images/CSS, HTML escaping, duplicate/oversized replies, strict request framing, 204 polling, and no-store responses.
 - `sh -n kobo/launch.sh kobo/install.sh kobo/uninstall.sh kobo/restore-nickel.sh`
   - Result: pass.
 - `bash -n scripts/build-kobo.sh`

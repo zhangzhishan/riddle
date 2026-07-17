@@ -55,6 +55,7 @@ def _validate_png(payload):
 
     offset = len(PNG_SIGNATURE)
     first_chunk = True
+    saw_ihdr = False
     saw_idat = False
     saw_iend = False
     while offset < len(payload):
@@ -72,6 +73,9 @@ def _validate_png(payload):
         if first_chunk and (kind != b"IHDR" or length != 13):
             raise ValidationError("invalid PNG header")
         if kind == b"IHDR":
+            if saw_ihdr or length != 13:
+                raise ValidationError("invalid PNG header")
+            saw_ihdr = True
             width, height = struct.unpack(">II", data[:8])
             if width == 0 or height == 0:
                 raise ValidationError("invalid PNG dimensions")
@@ -86,7 +90,7 @@ def _validate_png(payload):
         if saw_iend:
             break
 
-    if not saw_idat or not saw_iend:
+    if not saw_ihdr or not saw_idat or not saw_iend:
         raise ValidationError("incomplete PNG")
 
 
@@ -273,10 +277,12 @@ def create_server(host, port, store, device_token, family_token):
 
         def log_message(self, format, *args):
             # Preserve normal http.server logging while avoiding query-string token leakage.
-            safe_request = self.requestline.split("?", 1)[0]
+            safe_args = list(args)
+            if safe_args and isinstance(safe_args[0], str):
+                safe_args[0] = safe_args[0].split("?", 1)[0]
             print("{} - - [{}] {}".format(
                 self.client_address[0], self.log_date_time_string(),
-                format % ((safe_request,) + args[1:] if args else args),
+                format % tuple(safe_args),
             ), file=sys.stderr)
 
         def do_GET(self):
@@ -284,10 +290,10 @@ def create_server(host, port, store, device_token, family_token):
             if parsed.path == "/healthz" and not parsed.query and not parsed.fragment:
                 self._respond(HTTPStatus.OK, b"ok\n", "text/plain; charset=utf-8", private=False)
                 return
-            if parsed.path == "/api/device/replies":
+            if parsed.path == "/api/device/replies" and not parsed.fragment:
                 self._handle_reply_poll(parsed)
                 return
-            if parsed.path == "/":
+            if parsed.path == "/" and not parsed.fragment:
                 self._handle_family_index(parsed)
                 return
             image_match = _IMAGE_ROUTE.fullmatch(parsed.path)
@@ -309,6 +315,29 @@ def create_server(host, port, store, device_token, family_token):
                 self._handle_reply_form(int(reply_match.group(1)))
                 return
             self._plain_error(HTTPStatus.NOT_FOUND, "not found")
+
+        def do_HEAD(self):
+            self._method_not_allowed()
+
+        def do_PUT(self):
+            self._method_not_allowed()
+
+        def do_DELETE(self):
+            self._method_not_allowed()
+
+        def do_PATCH(self):
+            self._method_not_allowed()
+
+        def do_OPTIONS(self):
+            self._method_not_allowed()
+
+        def _method_not_allowed(self):
+            self._respond(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                b"",
+                None,
+                extra_headers=(("Allow", "GET, POST"),),
+            )
 
         def _handle_upload(self):
             if not self._device_authorized():
@@ -441,6 +470,9 @@ def create_server(host, port, store, device_token, family_token):
             if not self._family_authorized():
                 self._plain_error(HTTPStatus.FORBIDDEN, "forbidden")
                 return
+            if self.headers.get("Transfer-Encoding") is not None:
+                self._plain_error(HTTPStatus.BAD_REQUEST, "transfer encoding is not supported")
+                return
             content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
             if content_type != "application/x-www-form-urlencoded":
                 self._plain_error(
@@ -453,6 +485,9 @@ def create_server(host, port, store, device_token, family_token):
                 return
             try:
                 encoded = self.rfile.read(length)
+                if len(encoded) != length:
+                    self._plain_error(HTTPStatus.BAD_REQUEST, "incomplete request body")
+                    return
                 form_text = encoded.decode("utf-8", "strict")
                 pairs = urllib.parse.parse_qsl(
                     form_text, keep_blank_values=True, strict_parsing=True

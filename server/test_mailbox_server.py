@@ -1,5 +1,6 @@
 import http.client
 from pathlib import Path
+import socket
 import sqlite3
 import struct
 import tempfile
@@ -89,6 +90,16 @@ class MailboxStoreTests(unittest.TestCase):
         payload[-5] ^= 0x01
         with self.assertRaisesRegex(ValidationError, "PNG"):
             self.store.create_message("ian-kobo", bytes(payload))
+
+    def test_create_message_rejects_duplicate_malformed_ihdr(self):
+        signature = b"\x89PNG\r\n\x1a\n"
+        valid_ihdr = png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        malformed_ihdr = png_chunk(b"IHDR", b"short")
+        scanline = png_chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff"))
+        payload = signature + valid_ihdr + malformed_ihdr + scanline + png_chunk(b"IEND", b"")
+
+        with self.assertRaisesRegex(ValidationError, "PNG"):
+            self.store.create_message("ian-kobo", payload)
 
     def test_create_message_accepts_exact_size_limit_and_rejects_one_byte_more(self):
         base_size = len(make_png())
@@ -422,6 +433,40 @@ class MailboxHTTPTests(unittest.TestCase):
             404,
         )
 
+    def test_reply_form_rejects_transfer_encoding_and_incomplete_body(self):
+        cookie, _ = self.family_cookie()
+
+        chunked_message = self.store.create_message("ian-kobo", make_png())
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.putrequest("POST", f"/messages/{chunked_message}/reply")
+        connection.putheader("Cookie", cookie)
+        connection.putheader("Content-Type", "application/x-www-form-urlencoded")
+        connection.putheader("Content-Length", "10")
+        connection.putheader("Transfer-Encoding", "chunked")
+        connection.endheaders(b"body=hello")
+        response = connection.getresponse()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+        response.read()
+        connection.close()
+        self.assertIsNone(self.store.next_reply(0))
+
+        incomplete_message = self.store.create_message("ian-kobo", make_png())
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.putrequest("POST", f"/messages/{incomplete_message}/reply")
+        connection.putheader("Cookie", cookie)
+        connection.putheader("Content-Type", "application/x-www-form-urlencoded")
+        connection.putheader("Content-Length", "100")
+        connection.endheaders()
+        connection.send(b"body=hello")
+        connection.sock.shutdown(socket.SHUT_WR)
+        response = connection.getresponse()
+        self.assertEqual(response.status, 400)
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+        response.read()
+        connection.close()
+        self.assertIsNone(self.store.next_reply(0))
+
     def test_private_routes_have_strict_matching_and_no_store_errors(self):
         cookie, _ = self.family_cookie()
         cases = (
@@ -435,6 +480,21 @@ class MailboxHTTPTests(unittest.TestCase):
             status, response_headers, _ = self.request(method, path, headers=headers)
             self.assertEqual(status, 404, path)
             self.assertEqual(response_headers["Cache-Control"], "no-store")
+
+    def test_fragments_and_unsupported_methods_are_strict_no_store_errors(self):
+        for path, headers in (
+            (f"/?token={self.family_token}#fragment", {}),
+            ("/api/device/replies?after=0#fragment", self.device_headers),
+        ):
+            status, response_headers, _ = self.request("GET", path, headers=headers)
+            self.assertEqual(status, 404, path)
+            self.assertEqual(response_headers["Cache-Control"], "no-store")
+
+        for method in ("HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"):
+            status, response_headers, _ = self.request(method, "/")
+            self.assertEqual(status, 405, method)
+            self.assertEqual(response_headers["Cache-Control"], "no-store")
+            self.assertEqual(response_headers["Allow"], "GET, POST")
 
 
 if __name__ == "__main__":
