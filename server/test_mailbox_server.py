@@ -490,7 +490,17 @@ class MailboxHTTPTests(unittest.TestCase):
             self.assertEqual(status, 404, path)
             self.assertEqual(response_headers["Cache-Control"], "no-store")
 
-        for method in ("HEAD", "PUT", "DELETE", "PATCH", "OPTIONS"):
+        for method in (
+            "HEAD",
+            "PUT",
+            "DELETE",
+            "PATCH",
+            "OPTIONS",
+            "TRACE",
+            "CONNECT",
+            "PROPFIND",
+            "BREW",
+        ):
             status, response_headers, _ = self.request(method, "/")
             self.assertEqual(status, 405, method)
             self.assertEqual(response_headers["Cache-Control"], "no-store")

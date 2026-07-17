@@ -271,6 +271,14 @@ def create_server(host, port, store, device_token, family_token):
         server_version = "PaperPlaneMailbox"
         sys_version = ""
 
+        def __getattr__(self, name):
+            # BaseHTTPRequestHandler dispatches arbitrary methods by looking up
+            # do_<METHOD>. Route every unknown method through our cache-safe 405
+            # response instead of its default 501 implementation.
+            if name.startswith("do_"):
+                return self._method_not_allowed
+            raise AttributeError(name)
+
         def setup(self):
             super().setup()
             self.connection.settimeout(READ_TIMEOUT_SECONDS)
