@@ -32,6 +32,12 @@ Result:
 E2E PASS: message=2, reply_id=2, utf8=Ian，你的纸飞机到了！, anonymous_image=403
 ```
 
+## Browser QA
+
+The family capability URL was opened in a real browser session. The responsive page rendered the uploaded image and Chinese controls without JavaScript or console errors. A Chinese reply containing emoji was entered and submitted through the visible form; after redirect it appeared correctly under `家人的回信` with preserved punctuation and emoji.
+
+No functional or visual blocker was found in the desktop-width browser pass. The CSS uses a fluid `min(100% - 1.5rem, 42rem)` container, wrapped metadata, full-width textarea/button, and a 640 px breakpoint; a physical-phone pass remains part of deployment verification.
+
 ## Kobo cross-build
 
 Command: `./scripts/build-kobo.sh`
