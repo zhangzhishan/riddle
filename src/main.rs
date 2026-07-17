@@ -60,6 +60,7 @@ usage:
                               reply; verifies key + endpoint + model
   riddle --mailbox-send PNG   upload one PNG to the Paper Plane Mailbox
   riddle --mailbox-check [ID] poll for the first family reply after ID
+  riddle --mailbox            open Paper Plane Mailbox (Kobo build only)
   riddle --version            print the version
 
 configuration lives in oracle.env next to the binary — see
@@ -177,6 +178,21 @@ fn main() {
                 }
             }
             return;
+        }
+        Some("--mailbox") => {
+            #[cfg(all(feature = "kobo", target_os = "linux"))]
+            {
+                if let Err(error) = mailbox::run() {
+                    eprintln!("riddle: mailbox fatal: {error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            #[cfg(not(all(feature = "kobo", target_os = "linux")))]
+            {
+                eprintln!("riddle: --mailbox requires a Kobo Linux build");
+                std::process::exit(2);
+            }
         }
         Some("--version" | "-V") => {
             println!("riddle {}", env!("CARGO_PKG_VERSION"));

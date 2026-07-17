@@ -57,6 +57,20 @@ launcher itself is force-killed, recover over SSH:
 The Kobo artifact statically links FBInk (GPLv3+), so distributed Kobo binaries
 are subject to GPLv3 even though riddle's own source remains MIT.
 
+### Paper Plane Mailbox
+
+This branch also contains a private family mailbox MVP. The Kobo's separate
+**Paper Plane Mailbox** NickelMenu entry opens a deliberate-send drawing page:
+draw with the stylus, tap **SEND**, then confirm **SEND NOW**. Family members
+view the drawing and reply from the responsive browser UI in `server/`; replies
+are polled by **INBOX** and written back onto the e-ink page.
+
+The mailbox uses two independent capability tokens. Configure the server with
+`MAILBOX_DEVICE_TOKEN` and `MAILBOX_FAMILY_TOKEN`, then put only the device
+token and the HTTPS `MAILBOX_BASE_URL` in the Kobo's `oracle.env`. See
+`server/README.md` for local startup and security notes. Public deployment and
+TLS termination are intentionally separate from the app.
+
 ---
 
 _This is the diary from [the demo](https://x.com/MaximeRivest)._

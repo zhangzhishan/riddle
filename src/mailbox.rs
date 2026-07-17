@@ -217,6 +217,408 @@ fn confirm_target(x: i32, y: i32) -> bool {
         && y < SCREEN_H as i32
 }
 
+#[cfg(all(feature = "kobo", target_os = "linux"))]
+pub fn run() -> std::io::Result<()> {
+    use crate::fb::BBox;
+    use crate::ink::Ink;
+    use crate::mailbox_client::{MailboxClient, Reply as MailReply};
+    use crate::pen::{PenDevice, Tool, MAX_PRESSURE};
+    use crate::surface::{Surface, BLACK, WHITE};
+    use ab_glyph::FontRef;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::time::{Duration, Instant};
+
+    enum NetResult {
+        Upload(Result<u64, String>),
+        Poll(Result<Option<MailReply>, String>),
+    }
+
+    fn outbox_dir() -> PathBuf {
+        std::env::var_os("MAILBOX_OUTBOX_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/mnt/onboard/.adds/riddle-kobo/outbox"))
+    }
+
+    fn read_last_reply(dir: &Path) -> u64 {
+        std::fs::read_to_string(dir.join("last-reply-id"))
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn write_last_reply(dir: &Path, id: u64) {
+        let _ = std::fs::write(dir.join("last-reply-id"), format!("{id}\n"));
+    }
+
+    fn start_upload(tx: mpsc::Sender<NetResult>, page: PathBuf) {
+        std::thread::spawn(move || {
+            let result = MailboxClient::from_env()
+                .and_then(|client| client.send_png(page))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(NetResult::Upload(result));
+        });
+    }
+
+    fn start_poll(tx: mpsc::Sender<NetResult>, after: u64) {
+        std::thread::spawn(move || {
+            let result = MailboxClient::from_env()
+                .and_then(|client| client.poll_reply(after))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(NetResult::Poll(result));
+        });
+    }
+
+    fn draw_text(
+        surf: &mut Surface,
+        font: &FontRef,
+        text: &str,
+        px: f32,
+        center_x: usize,
+        y: usize,
+    ) {
+        let line = crate::script::rasterize_line(font, text, px);
+        let x0 = center_x.saturating_sub(line.width / 2);
+        for row in 0..line.height {
+            for col in 0..line.width {
+                if line.mask[row * line.width + col] {
+                    surf.put_px((x0 + col) as i32, (y + row) as i32, BLACK);
+                }
+            }
+        }
+    }
+
+    fn render_compose_shell(surf: &mut Surface, font: &FontRef) {
+        surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+        draw_text(
+            surf,
+            font,
+            "Ian's Paper Plane Mailbox",
+            64.0,
+            SCREEN_W / 2,
+            24,
+        );
+        let y = SCREEN_H - ACTION_BAR_H as usize;
+        surf.fill_rect(0, y, SCREEN_W, ACTION_BAR_H as usize, WHITE);
+    }
+
+    fn render_controls(surf: &mut Surface, font: &FontRef, state: &MailboxState) {
+        let y = SCREEN_H - ACTION_BAR_H as usize;
+        surf.fill_rect(0, y, SCREEN_W, ACTION_BAR_H as usize, WHITE);
+        surf.fill_rect(0, y, SCREEN_W, 3, BLACK);
+        match &state.screen {
+            Screen::Compose => {
+                let third = SCREEN_W / 3;
+                surf.fill_rect(third, y, 2, ACTION_BAR_H as usize, BLACK);
+                surf.fill_rect(third * 2, y, 2, ACTION_BAR_H as usize, BLACK);
+                draw_text(surf, font, "SEND", 56.0, third / 2, y + 50);
+                draw_text(surf, font, "INBOX", 56.0, third + third / 2, y + 50);
+                draw_text(surf, font, "CLEAR", 56.0, third * 2 + third / 2, y + 50);
+            }
+            Screen::ConfirmSend => {
+                surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
+                draw_text(surf, font, "CANCEL", 52.0, SCREEN_W / 4, y + 50);
+                draw_text(surf, font, "SEND NOW", 52.0, SCREEN_W * 3 / 4, y + 50);
+            }
+            Screen::ConfirmClear => {
+                surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
+                draw_text(surf, font, "CANCEL", 52.0, SCREEN_W / 4, y + 50);
+                draw_text(surf, font, "CLEAR PAGE", 52.0, SCREEN_W * 3 / 4, y + 50);
+            }
+            Screen::Sending => draw_text(
+                surf,
+                font,
+                "Folding and sending...",
+                52.0,
+                SCREEN_W / 2,
+                y + 50,
+            ),
+            Screen::CheckingInbox => draw_text(
+                surf,
+                font,
+                "Looking for paper planes...",
+                52.0,
+                SCREEN_W / 2,
+                y + 50,
+            ),
+            Screen::Reply { .. } => draw_text(
+                surf,
+                font,
+                "Tap anywhere to return",
+                48.0,
+                SCREEN_W / 2,
+                y + 56,
+            ),
+            Screen::Error { message, .. } => {
+                surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
+                let short: String = message.chars().take(34).collect();
+                draw_text(surf, font, "CANCEL", 46.0, SCREEN_W / 4, y + 70);
+                draw_text(surf, font, "TRY AGAIN", 46.0, SCREEN_W * 3 / 4, y + 70);
+                draw_text(surf, font, &short, 30.0, SCREEN_W / 2, y + 16);
+            }
+        }
+    }
+
+    fn render_reply(
+        surf: &mut Surface,
+        display: &crate::display::Display,
+        font: &FontRef,
+        body: &str,
+    ) {
+        surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
+        draw_text(
+            surf,
+            font,
+            "A paper plane came back",
+            58.0,
+            SCREEN_W / 2,
+            30,
+        );
+        display.update_all(SCREEN_W, SCREEN_H);
+        let lines = crate::script::wrap(font, body, 72.0, (SCREEN_W - 180) as f32);
+        let mut y = 170i32;
+        for text in lines.into_iter().take(12) {
+            let mut raster = crate::script::rasterize_line(font, &text, 72.0);
+            crate::script::thin(&mut raster);
+            let x0 = (SCREEN_W as i32 - raster.width as i32) / 2;
+            let strokes = crate::script::trace(&raster);
+            let mut dirty = BBox::empty();
+            for (index, stroke) in strokes.iter().enumerate() {
+                let mut previous = None;
+                for &(sx, sy) in stroke {
+                    let (x, yy) = (x0 + sx, y + sy);
+                    if let Some((px, py)) = previous {
+                        surf.brush_line(px, py, x, yy, 2, BLACK);
+                    } else {
+                        surf.stamp(x, yy, 2, BLACK);
+                    }
+                    dirty.add(x, yy, 4);
+                    previous = Some((x, yy));
+                }
+                if index % 18 == 17 && !dirty.is_empty() {
+                    let (x, yy, w, h) = dirty.rect();
+                    display.update(x, yy, w, h, true);
+                    dirty = BBox::empty();
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+            }
+            if !dirty.is_empty() {
+                let (x, yy, w, h) = dirty.rect();
+                display.update(x, yy, w, h, true);
+            }
+            y += 96;
+            if y >= SCREEN_H as i32 - ACTION_BAR_H - 100 {
+                break;
+            }
+        }
+    }
+
+    let font = FontRef::try_from_slice(crate::FONT_TTF).map_err(std::io::Error::other)?;
+    let (display, mut surface) = crate::display::Display::open()?;
+    let mut pen = PenDevice::open()?;
+    let outbox = outbox_dir();
+    std::fs::create_dir_all(&outbox)?;
+    let page_path = outbox.join("pending.png");
+    let started = Instant::now();
+    let mut state = MailboxState::new(read_last_reply(&outbox), 0);
+    let mut ink = Ink::new();
+    let mut pen_down = false;
+    let mut press_target = ComposeTarget::Outside;
+    let mut dirty = BBox::empty();
+    let mut last_flush = Instant::now();
+    let mut compose_snapshot: Option<Vec<u8>> = None;
+    let (net_tx, net_rx) = mpsc::channel();
+    let stopping = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stopping))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stopping))?;
+
+    render_compose_shell(&mut surface, &font);
+    render_controls(&mut surface, &font, &state);
+    display.full_refresh(SCREEN_W, SCREEN_H);
+
+    let apply_action = |action: Action,
+                        state: &mut MailboxState,
+                        ink: &mut Ink,
+                        surface: &mut Surface,
+                        display: &crate::display::Display,
+                        snapshot: &mut Option<Vec<u8>>| {
+        match action {
+            Action::Upload => {
+                if let Err(error) = ink.to_png(surface, page_path.to_str().unwrap()) {
+                    state.upload_finished(Err(error.to_string()));
+                } else {
+                    start_upload(net_tx.clone(), page_path.clone());
+                }
+                render_controls(surface, &font, state);
+                display.update(
+                    0,
+                    SCREEN_H as i32 - ACTION_BAR_H,
+                    SCREEN_W as i32,
+                    ACTION_BAR_H,
+                    false,
+                );
+            }
+            Action::Poll { after } => {
+                start_poll(net_tx.clone(), after);
+                render_controls(surface, &font, state);
+                display.update(
+                    0,
+                    SCREEN_H as i32 - ACTION_BAR_H,
+                    SCREEN_W as i32,
+                    ACTION_BAR_H,
+                    false,
+                );
+            }
+            Action::ClearCanvas => {
+                ink.clear();
+                render_compose_shell(surface, &font);
+                render_controls(surface, &font, state);
+                display.full_refresh(SCREEN_W, SCREEN_H);
+                let _ = std::fs::remove_file(&page_path);
+            }
+            Action::DismissReply => {
+                if let Some(saved) = snapshot.take() {
+                    surface.paste_rect(0, 0, SCREEN_W, SCREEN_H, &saved);
+                } else {
+                    render_compose_shell(surface, &font);
+                }
+                render_controls(surface, &font, state);
+                display.full_refresh(SCREEN_W, SCREEN_H);
+            }
+            Action::None | Action::Draw => {
+                render_controls(surface, &font, state);
+                display.update(
+                    0,
+                    SCREEN_H as i32 - ACTION_BAR_H,
+                    SCREEN_W as i32,
+                    ACTION_BAR_H,
+                    false,
+                );
+            }
+        }
+    };
+
+    while !stopping.load(Ordering::Relaxed) {
+        let now_ms = started.elapsed().as_millis() as u64;
+        while let Ok(result) = net_rx.try_recv() {
+            match result {
+                NetResult::Upload(result) => {
+                    let action = state.upload_finished(result);
+                    apply_action(
+                        action,
+                        &mut state,
+                        &mut ink,
+                        &mut surface,
+                        &display,
+                        &mut compose_snapshot,
+                    );
+                }
+                NetResult::Poll(result) => {
+                    let result = result.map(|reply| reply.map(|reply| (reply.id, reply.body)));
+                    if result
+                        .as_ref()
+                        .ok()
+                        .and_then(|reply| reply.as_ref())
+                        .is_some()
+                    {
+                        compose_snapshot = Some(surface.copy_rect(0, 0, SCREEN_W, SCREEN_H));
+                    }
+                    state.poll_finished(result);
+                    if let Screen::Reply { id, body } = &state.screen {
+                        write_last_reply(&outbox, *id);
+                        render_reply(&mut surface, &display, &font, body);
+                    }
+                    render_controls(&mut surface, &font, &state);
+                    display.update(
+                        0,
+                        SCREEN_H as i32 - ACTION_BAR_H,
+                        SCREEN_W as i32,
+                        ACTION_BAR_H,
+                        false,
+                    );
+                }
+            }
+        }
+
+        for sample in pen.drain() {
+            let touching = sample.touching && sample.pressure > 40;
+            if touching && !pen_down {
+                pen_down = true;
+                press_target = MailboxState::target(sample.x, sample.y);
+            }
+            if touching {
+                if matches!(state.screen, Screen::Compose)
+                    && press_target == ComposeTarget::Canvas
+                    && MailboxState::target(sample.x, sample.y) == ComposeTarget::Canvas
+                {
+                    let changed = match sample.tool {
+                        Tool::Pen => {
+                            let radius = 2 + sample.pressure * 3 / MAX_PRESSURE;
+                            ink.pen_point(&mut surface, sample.x, sample.y, radius)
+                        }
+                        Tool::Eraser => ink.erase_point(&mut surface, sample.x, sample.y, 22),
+                    };
+                    if !changed.is_empty() {
+                        dirty.add(changed.x0, changed.y0, 0);
+                        dirty.add(changed.x1, changed.y1, 0);
+                    }
+                }
+                continue;
+            }
+            if pen_down {
+                pen_down = false;
+                ink.pen_up();
+                let release_target = MailboxState::target(sample.x, sample.y);
+                let action = if matches!(state.screen, Screen::Compose) {
+                    if press_target == ComposeTarget::Canvas {
+                        state.note_ink();
+                        Action::None
+                    } else if press_target == release_target {
+                        state.tap(sample.x, sample.y, now_ms)
+                    } else {
+                        Action::None
+                    }
+                } else {
+                    state.tap(sample.x, sample.y, now_ms)
+                };
+                apply_action(
+                    action,
+                    &mut state,
+                    &mut ink,
+                    &mut surface,
+                    &display,
+                    &mut compose_snapshot,
+                );
+                press_target = ComposeTarget::Outside;
+            }
+        }
+        if pen.take_quit_requested() {
+            break;
+        }
+        if !dirty.is_empty() && last_flush.elapsed() >= Duration::from_millis(8) {
+            let (x, y, w, h) = dirty.rect();
+            display.update(x, y, w, h, true);
+            dirty = BBox::empty();
+            last_flush = Instant::now();
+        }
+        let action = state.tick(now_ms);
+        if action != Action::None {
+            apply_action(
+                action,
+                &mut state,
+                &mut ink,
+                &mut surface,
+                &display,
+                &mut compose_snapshot,
+            );
+        }
+        let _ = display.pump();
+        std::thread::sleep(Duration::from_millis(4));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

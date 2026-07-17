@@ -92,7 +92,14 @@ if [ -f "$APP_DIR/oracle.env" ]; then
 fi
 
 printf '\n=== launch %s ===\n' "$(date)" >>"$LOG"
-"$BIN" >>"$LOG" 2>&1 &
+case "${RIDDLE_LAUNCH_MODE:-diary}" in
+    mailbox) "$BIN" --mailbox >>"$LOG" 2>&1 & ;;
+    diary) "$BIN" >>"$LOG" 2>&1 & ;;
+    *)
+        log "riddle: unknown launch mode: $RIDDLE_LAUNCH_MODE"
+        exit 5
+        ;;
+esac
 CHILD=$!
 wait "$CHILD"
 STATUS=$?

@@ -1,2 +1,3 @@
 # riddle-kobo — unique filename so it does not overwrite other mods.
 menu_item :main :Riddle Diary :cmd_spawn :quiet:/bin/sh /mnt/onboard/.adds/riddle-kobo/launch.sh
+menu_item :main :Paper Plane Mailbox :cmd_spawn :quiet:env RIDDLE_LAUNCH_MODE=mailbox /bin/sh /mnt/onboard/.adds/riddle-kobo/launch.sh
