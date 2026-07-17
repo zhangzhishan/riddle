@@ -55,8 +55,8 @@ Artifact:
 
 ```text
 dist/riddle-kobo.zip
-bytes: 5,447,794
-sha256: 521270137c359a277ee41057814ccd07bae817910943c8458b6ad7c70d1725d7
+bytes: 5,448,322
+sha256: eb3fd317c64859512049816b0c2b510028686e4bca75c7341891ca5ff5e267b2
 ```
 
 ## Still requires real-device verification
