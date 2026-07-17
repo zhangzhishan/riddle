@@ -27,7 +27,11 @@ const ABS_MT_TRACKING_ID: u16 = 57;
 const ABS_MT_PRESSURE: u16 = 58;
 const MT_TOOL_PEN: i32 = 1;
 const MAX_SLOTS: usize = 16;
-const EVIOCGRAB: libc::c_ulong = 0x40044590;
+#[cfg(target_env = "musl")]
+type IoctlRequest = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlRequest = libc::c_ulong;
+const EVIOCGRAB: IoctlRequest = 0x40044590u32 as IoctlRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
@@ -330,7 +334,7 @@ fn query_axis(fd: RawFd, axis: u16) -> Option<Axis> {
     let request = ((2u64 << 30)
         | ((size_of::<InputAbsInfo>() as u64) << 16)
         | ((b'E' as u64) << 8)
-        | (0x40 + axis as u64)) as libc::c_ulong;
+        | (0x40 + axis as u64)) as IoctlRequest;
     let mut info = InputAbsInfo::default();
     let rv = unsafe { libc::ioctl(fd, request, &mut info) };
     (rv == 0 && info.maximum > info.minimum).then_some(Axis {

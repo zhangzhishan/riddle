@@ -6,6 +6,58 @@ writes itself back in a flowing hand, stroke by stroke, then fades away.
 
 No screen glow, no keyboard, no chat UI. Just ink appearing on paper.
 
+## Kobo Elipsa 2E port (work in progress)
+
+This branch adds a native standalone backend for **Kobo Elipsa 2E**
+(`condor`, Mark 11, ARMv7, 1404×1872 at 227 DPI):
+
+- FBInk-backed Gray8 framebuffer mapping and DU/GL16/GC16 partial refreshes;
+- the combined multitouch/stylus evdev protocol, including pressure and the
+  mirrored Y axis used by Condor;
+- a reversible NickelMenu launcher which pauses Nickel and always resumes it;
+- a read-only hardware probe and non-destructive install/uninstall scripts.
+
+Build on macOS:
+
+```sh
+brew install zig
+cargo install cargo-zigbuild
+./scripts/build-kobo.sh
+```
+
+Install after connecting the Kobo in USB storage mode (NickelMenu must already
+be installed):
+
+```sh
+./kobo/install.sh /Volumes/KOBOeReader
+```
+
+Copy `oracle.env.example` to `oracle.env` inside
+`.adds/riddle-kobo/`, configure a vision-capable OpenAI-compatible endpoint,
+then safely eject. Launch **Riddle Diary** from NickelMenu. To exit, press the
+Stylus 2 eraser and side button together. The separate **Restore Kobo UI** menu
+item runs the emergency Nickel resume script.
+
+Before the first real launch, collect an exact device report over SSH/telnet:
+
+```sh
+/mnt/onboard/.adds/riddle-kobo/kobo-probe.sh \
+  >/mnt/onboard/riddle-kobo-probe.txt 2>&1
+```
+
+The launcher never kills Nickel: it sends SIGSTOP immediately before riddle
+starts and SIGCONT from a shell trap on every normal/error exit. If needed over
+SSH, recover with:
+
+```sh
+killall -CONT nickel hindenburg sickel
+```
+
+The Kobo artifact statically links FBInk (GPLv3+), so distributed Kobo binaries
+are subject to GPLv3 even though riddle's own source remains MIT.
+
+---
+
 _This is the diary from [the demo](https://x.com/MaximeRivest)._
 
 ### 🪄 New to this? Start here

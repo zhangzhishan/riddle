@@ -8,7 +8,11 @@ use std::os::fd::RawFd;
 
 const EV_KEY: u16 = 1;
 const KEY_POWER: u16 = 116;
-const EVIOCGRAB: libc::c_ulong = 0x40044590;
+#[cfg(target_env = "musl")]
+type IoctlRequest = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlRequest = libc::c_ulong;
+const EVIOCGRAB: IoctlRequest = 0x40044590u32 as IoctlRequest;
 
 pub struct PowerButton {
     fd: RawFd,

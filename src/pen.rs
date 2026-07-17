@@ -26,7 +26,11 @@ const BTN_TOOL_PEN: u16 = 320;
 const BTN_TOOL_RUBBER: u16 = 321;
 const BTN_TOUCH: u16 = 330;
 
-const EVIOCGRAB: libc::c_ulong = 0x40044590;
+#[cfg(target_env = "musl")]
+type IoctlRequest = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlRequest = libc::c_ulong;
+const EVIOCGRAB: IoctlRequest = 0x40044590u32 as IoctlRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {

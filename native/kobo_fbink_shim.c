@@ -8,6 +8,11 @@
 
 #include "fbink.h"
 
+enum {
+    RIDDLE_GRAYSCALE_8BIT = 1,
+    RIDDLE_GRAYSCALE_8BIT_INVERTED = 2,
+};
+
 struct riddle_kobo_fb {
     int fd;
     uint8_t original_bpp;
@@ -55,12 +60,12 @@ riddle_kobo_fb *riddle_kobo_fb_open(riddle_kobo_fb_info *info, char *error, size
     memset(&state, 0, sizeof(state));
     fbink_get_state(&ctx->base, &state);
     ctx->original_bpp = (uint8_t)state.bpp;
-    ctx->original_grayscale = state.inverted_grayscale ? GRAYSCALE_8BIT_INVERTED : GRAYSCALE_8BIT;
+    ctx->original_grayscale = state.inverted_grayscale ? RIDDLE_GRAYSCALE_8BIT_INVERTED : RIDDLE_GRAYSCALE_8BIT;
 
     // Condor supports switching bit depth. Gray8 is FBInk's fastest path and
     // gives riddle a simple one-byte-per-pixel drawing surface.
     if (state.bpp != 8) {
-        int rv = fbink_set_fb_info(ctx->fd, KEEP_CURRENT_ROTATE, 8, GRAYSCALE_8BIT, &ctx->base);
+        int rv = fbink_set_fb_info(ctx->fd, KEEP_CURRENT_ROTATE, 8, RIDDLE_GRAYSCALE_8BIT, &ctx->base);
         if (rv < 0) {
             set_error(error, error_len, "cannot switch framebuffer to Gray8");
             fbink_close(ctx->fd);
