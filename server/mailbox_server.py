@@ -567,33 +567,33 @@ def create_server(host, port, store, device_token, family_token):
                 if message["reply_body"] is None:
                     response = """
                     <form action="/messages/{0}/reply" method="post">
-                      <label for="reply-{0}">Write back</label>
+                      <label for="reply-{0}">给 Ian 回信</label>
                       <textarea id="reply-{0}" name="body" maxlength="2000" required></textarea>
-                      <button type="submit">Send reply</button>
+                      <button type="submit">发送回信</button>
                     </form>""".format(message_id)
                 else:
                     reply = html.escape(message["reply_body"], quote=True)
-                    response = '<div class="reply"><strong>Family reply</strong><p>{}</p></div>'.format(reply)
+                    response = '<div class="reply"><strong>家人的回信</strong><p>{}</p></div>'.format(reply)
                 cards.append("""
                 <article class="message-card" id="message-{0}">
-                  <header><span>From {1}</span><time datetime="{2}">{2}</time></header>
-                  <img src="/messages/{0}.png" alt="Drawing number {0}" loading="lazy">
+                  <header><span>来自 {1}</span><time datetime="{2}">{2}</time></header>
+                  <img src="/messages/{0}.png" alt="Ian 的第 {0} 张画" loading="lazy">
                   {3}
                 </article>""".format(message_id, device, created, response))
             if not cards:
-                cards.append('<p class="empty">No paper planes have arrived yet.</p>')
+                cards.append('<p class="empty">还没有纸飞机飞过来。</p>')
             return """<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Ian's Paper Plane Mailbox</title>
+  <title>Ian 的纸飞机信箱</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <main>
-    <h1>Paper Plane Mailbox</h1>
-    <p class="intro">Drawings from Ian, newest first.</p>
+    <h1>Ian 的纸飞机信箱</h1>
+    <p class="intro">Ian 的画，最新一张在最前面。</p>
     {0}
   </main>
 </body>

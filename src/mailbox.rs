@@ -292,14 +292,7 @@ pub fn run() -> std::io::Result<()> {
 
     fn render_compose_shell(surf: &mut Surface, font: &FontRef) {
         surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
-        draw_text(
-            surf,
-            font,
-            "Ian's Paper Plane Mailbox",
-            64.0,
-            SCREEN_W / 2,
-            24,
-        );
+        draw_text(surf, font, "Ian 的纸飞机信箱", 64.0, SCREEN_W / 2, 24);
         let y = SCREEN_H - ACTION_BAR_H as usize;
         surf.fill_rect(0, y, SCREEN_W, ACTION_BAR_H as usize, WHITE);
     }
@@ -313,49 +306,37 @@ pub fn run() -> std::io::Result<()> {
                 let third = SCREEN_W / 3;
                 surf.fill_rect(third, y, 2, ACTION_BAR_H as usize, BLACK);
                 surf.fill_rect(third * 2, y, 2, ACTION_BAR_H as usize, BLACK);
-                draw_text(surf, font, "SEND", 56.0, third / 2, y + 50);
-                draw_text(surf, font, "INBOX", 56.0, third + third / 2, y + 50);
-                draw_text(surf, font, "CLEAR", 56.0, third * 2 + third / 2, y + 50);
+                draw_text(surf, font, "发送", 56.0, third / 2, y + 50);
+                draw_text(surf, font, "收信", 56.0, third + third / 2, y + 50);
+                draw_text(surf, font, "清空", 56.0, third * 2 + third / 2, y + 50);
             }
             Screen::ConfirmSend => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
-                draw_text(surf, font, "CANCEL", 52.0, SCREEN_W / 4, y + 50);
-                draw_text(surf, font, "SEND NOW", 52.0, SCREEN_W * 3 / 4, y + 50);
+                draw_text(surf, font, "取消", 52.0, SCREEN_W / 4, y + 50);
+                draw_text(surf, font, "现在发送", 52.0, SCREEN_W * 3 / 4, y + 50);
             }
             Screen::ConfirmClear => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
-                draw_text(surf, font, "CANCEL", 52.0, SCREEN_W / 4, y + 50);
-                draw_text(surf, font, "CLEAR PAGE", 52.0, SCREEN_W * 3 / 4, y + 50);
+                draw_text(surf, font, "取消", 52.0, SCREEN_W / 4, y + 50);
+                draw_text(surf, font, "清空画纸", 52.0, SCREEN_W * 3 / 4, y + 50);
             }
-            Screen::Sending => draw_text(
-                surf,
-                font,
-                "Folding and sending...",
-                52.0,
-                SCREEN_W / 2,
-                y + 50,
-            ),
+            Screen::Sending => draw_text(surf, font, "正在折纸飞机……", 52.0, SCREEN_W / 2, y + 50),
             Screen::CheckingInbox => draw_text(
                 surf,
                 font,
-                "Looking for paper planes...",
+                "正在看看有没有回信……",
                 52.0,
                 SCREEN_W / 2,
                 y + 50,
             ),
-            Screen::Reply { .. } => draw_text(
-                surf,
-                font,
-                "Tap anywhere to return",
-                48.0,
-                SCREEN_W / 2,
-                y + 56,
-            ),
+            Screen::Reply { .. } => {
+                draw_text(surf, font, "点一下回到画纸", 48.0, SCREEN_W / 2, y + 56)
+            }
             Screen::Error { message, .. } => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
                 let short: String = message.chars().take(34).collect();
-                draw_text(surf, font, "CANCEL", 46.0, SCREEN_W / 4, y + 70);
-                draw_text(surf, font, "TRY AGAIN", 46.0, SCREEN_W * 3 / 4, y + 70);
+                draw_text(surf, font, "取消", 46.0, SCREEN_W / 4, y + 70);
+                draw_text(surf, font, "再试一次", 46.0, SCREEN_W * 3 / 4, y + 70);
                 draw_text(surf, font, &short, 30.0, SCREEN_W / 2, y + 16);
             }
         }
@@ -368,14 +349,7 @@ pub fn run() -> std::io::Result<()> {
         body: &str,
     ) {
         surf.fill_rect(0, 0, SCREEN_W, SCREEN_H, WHITE);
-        draw_text(
-            surf,
-            font,
-            "A paper plane came back",
-            58.0,
-            SCREEN_W / 2,
-            30,
-        );
+        draw_text(surf, font, "纸飞机飞回来了", 58.0, SCREEN_W / 2, 30);
         display.update_all(SCREEN_W, SCREEN_H);
         let lines = wrap_reply(font, body, 72.0, (SCREEN_W - 180) as f32);
         let mut y = 170i32;

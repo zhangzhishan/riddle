@@ -338,6 +338,9 @@ class MailboxHTTPTests(unittest.TestCase):
         html = body.decode()
 
         self.assertEqual(status, 200)
+        self.assertIn('<html lang="zh-CN">', html)
+        self.assertIn("Ian 的纸飞机信箱", html)
+        self.assertIn("给 Ian 回信", html)
         self.assertIn('<meta name="viewport" content="width=device-width, initial-scale=1">', html)
         self.assertLess(html.index(f'message-{second}'), html.index(f'message-{first}'))
         self.assertNotIn("<script>alert(1)</script>", html)
