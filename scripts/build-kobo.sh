@@ -37,6 +37,7 @@ install -m 755 "$ROOT/kobo/launch.sh" "$DIST/.adds/riddle-kobo/launch.sh"
 install -m 755 "$ROOT/kobo/restore-nickel.sh" "$DIST/.adds/riddle-kobo/restore-nickel.sh"
 install -m 755 "$ROOT/scripts/kobo-probe.sh" "$DIST/.adds/riddle-kobo/kobo-probe.sh"
 install -m 644 "$ROOT/oracle.env.example" "$DIST/.adds/riddle-kobo/oracle.env.example"
+install -m 644 "$ROOT/fonts/mailbox/OFL.txt" "$DIST/.adds/riddle-kobo/MaShanZheng-OFL.txt"
 install -m 644 "$ROOT/kobo/nm/riddle-kobo" "$DIST/.adds/nm/riddle-kobo"
 
 (

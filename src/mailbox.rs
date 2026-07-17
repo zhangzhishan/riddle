@@ -8,6 +8,7 @@ use crate::fb::{SCREEN_H, SCREEN_W};
 
 pub const ACTION_BAR_H: i32 = 180;
 const AUTO_POLL_MS: u64 = 60_000;
+const MAILBOX_FONT_TTF: &[u8] = include_bytes!("../fonts/mailbox/MaShanZheng-Regular.ttf");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retry {
@@ -376,7 +377,7 @@ pub fn run() -> std::io::Result<()> {
             30,
         );
         display.update_all(SCREEN_W, SCREEN_H);
-        let lines = crate::script::wrap(font, body, 72.0, (SCREEN_W - 180) as f32);
+        let lines = wrap_reply(font, body, 72.0, (SCREEN_W - 180) as f32);
         let mut y = 170i32;
         for text in lines.into_iter().take(12) {
             let mut raster = crate::script::rasterize_line(font, &text, 72.0);
@@ -414,7 +415,28 @@ pub fn run() -> std::io::Result<()> {
         }
     }
 
-    let font = FontRef::try_from_slice(crate::FONT_TTF).map_err(std::io::Error::other)?;
+    fn wrap_reply(font: &FontRef, text: &str, px: f32, max_width: f32) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        for ch in text.chars() {
+            if ch == '\n' {
+                lines.push(std::mem::take(&mut current));
+                continue;
+            }
+            let mut candidate = current.clone();
+            candidate.push(ch);
+            if !current.is_empty() && crate::script::measure(font, &candidate, px) > max_width {
+                lines.push(std::mem::take(&mut current));
+            }
+            current.push(ch);
+        }
+        if !current.is_empty() || lines.is_empty() {
+            lines.push(current);
+        }
+        lines
+    }
+
+    let font = FontRef::try_from_slice(MAILBOX_FONT_TTF).map_err(std::io::Error::other)?;
     let (display, mut surface) = crate::display::Display::open()?;
     let mut pen = PenDevice::open()?;
     let outbox = outbox_dir();
@@ -570,9 +592,10 @@ pub fn run() -> std::io::Result<()> {
                 pen_down = false;
                 ink.pen_up();
                 let release_target = MailboxState::target(sample.x, sample.y);
+                let screen_before = state.screen.clone();
                 let action = if matches!(state.screen, Screen::Compose) {
                     if press_target == ComposeTarget::Canvas {
-                        state.note_ink();
+                        state.has_ink = !ink.is_empty();
                         Action::None
                     } else if press_target == release_target {
                         state.tap(sample.x, sample.y, now_ms)
@@ -582,14 +605,16 @@ pub fn run() -> std::io::Result<()> {
                 } else {
                     state.tap(sample.x, sample.y, now_ms)
                 };
-                apply_action(
-                    action,
-                    &mut state,
-                    &mut ink,
-                    &mut surface,
-                    &display,
-                    &mut compose_snapshot,
-                );
+                if action != Action::None || state.screen != screen_before {
+                    apply_action(
+                        action,
+                        &mut state,
+                        &mut ink,
+                        &mut surface,
+                        &display,
+                        &mut compose_snapshot,
+                    );
+                }
                 press_target = ComposeTarget::Outside;
             }
         }
@@ -602,7 +627,11 @@ pub fn run() -> std::io::Result<()> {
             dirty = BBox::empty();
             last_flush = Instant::now();
         }
-        let action = state.tick(now_ms);
+        let action = if pen_down {
+            Action::None
+        } else {
+            state.tick(now_ms)
+        };
         if action != Action::None {
             apply_action(
                 action,
@@ -622,6 +651,7 @@ pub fn run() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ab_glyph::{Font, FontRef};
 
     fn center(target: ComposeTarget) -> (i32, i32) {
         let y = SCREEN_H as i32 - ACTION_BAR_H / 2;
@@ -745,5 +775,12 @@ mod tests {
         assert_eq!(state.tick(59_999), Action::None);
         assert_eq!(state.tick(60_000), Action::Poll { after: 8 });
         assert!(state.has_ink);
+    }
+
+    #[test]
+    fn bundled_mailbox_font_contains_chinese_glyphs() {
+        let font = FontRef::try_from_slice(MAILBOX_FONT_TTF).unwrap();
+        assert_ne!(font.glyph_id('纸').0, 0);
+        assert_ne!(font.glyph_id('飞').0, 0);
     }
 }

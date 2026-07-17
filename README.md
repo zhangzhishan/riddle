@@ -71,6 +71,10 @@ token and the HTTPS `MAILBOX_BASE_URL` in the Kobo's `oracle.env`. See
 `server/README.md` for local startup and security notes. Public deployment and
 TLS termination are intentionally separate from the app.
 
+Chinese and Latin mailbox replies use the bundled **Ma Shan Zheng** handwriting
+font from Google Fonts, licensed under SIL Open Font License 1.1; its license is
+included in `fonts/mailbox/OFL.txt` and in the staged Kobo bundle.
+
 ---
 
 _This is the diary from [the demo](https://x.com/MaximeRivest)._

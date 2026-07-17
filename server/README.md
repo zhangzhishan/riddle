@@ -21,7 +21,7 @@ This server speaks plain HTTP. Put it behind an HTTPS reverse proxy before expos
 
 ## Device protocol
 
-- `POST /api/device/messages` with `Authorization: Bearer <device-token>`, `Content-Type: image/png`, `X-Device-Id`, and a raw PNG body no larger than 4 MiB.
+- `POST /api/device/messages` with `Authorization: Bearer DEVICE_TOKEN`, `Content-Type: image/png`, `X-Device-Id`, and a raw PNG body no larger than 4 MiB.
 - `GET /api/device/replies?after=<reply-id>` with device authorization. It returns `204` or UTF-8 text plus `X-Reply-Id`.
 - `GET /healthz` is public and contains only `ok`.
 
