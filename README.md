@@ -11,10 +11,10 @@ No screen glow, no keyboard, no chat UI. Just ink appearing on paper.
 This branch adds a native standalone backend for **Kobo Elipsa 2E**
 (`condor`, Mark 11, ARMv7, 1404×1872 at 227 DPI):
 
-- FBInk-backed Gray8 framebuffer mapping and DU/GL16/GC16 partial refreshes;
+- FBInk-backed native RGB32/Gray8 framebuffer mapping and DU/GL16/GC16 partial refreshes;
 - the combined multitouch/stylus evdev protocol, including pressure and the
   mirrored Y axis used by Condor;
-- a reversible NickelMenu launcher which pauses Nickel and always resumes it;
+- a reversible NickelMenu launcher which restores framebuffer state and restarts Nickel;
 - a read-only hardware probe and non-destructive install/uninstall scripts.
 
 Build on macOS:
@@ -45,9 +45,10 @@ Before the first real launch, collect an exact device report over SSH/telnet:
 ```
 
 The launcher captures the exact framebuffer bpp/grayscale/native rotation,
-terminates Nickel, and runs riddle in canonical portrait Gray8. On every normal
-or crash exit, its parent shell restores the saved mode before restarting a
-fresh Nickel process. If the launcher itself is force-killed, recover over SSH:
+terminates Nickel, and runs riddle in canonical portrait using the device's
+native RGB32 or Gray8 layout. On every normal or crash exit, its parent shell
+restores the saved mode before restarting a fresh Nickel process. If the
+launcher itself is force-killed, recover over SSH:
 
 ```sh
 /mnt/onboard/.adds/riddle-kobo/restore-nickel.sh

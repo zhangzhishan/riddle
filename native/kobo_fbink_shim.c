@@ -118,12 +118,16 @@ riddle_kobo_fb *riddle_kobo_fb_open(riddle_kobo_fb_info *info, char *error, size
     read_state(&ctx->original);
     const uint32_t canonical_ur = fbink_rota_canonical_to_native(0);
 
-    // Always use normal Gray8 in canonical portrait. This keeps the Rust
-    // surface and Condor's fixed touch transform in the same coordinate space.
-    if (state.bpp != 8 || state.inverted_grayscale || state.current_rota != canonical_ur) {
-        int rv = fbink_set_fb_info(ctx->fd, canonical_ur, 8, RIDDLE_GRAYSCALE_8BIT, &ctx->base);
+    // Keep Condor's native bit depth (normally RGB32) and only normalize the
+    // device rotation. If firmware happens to expose inverted Gray8, normalize
+    // its grayscale semantics as well. This avoids relying on an unsupported
+    // MTK 32→8 bpp switch.
+    const bool normalize_gray8 = state.bpp == 8 && state.inverted_grayscale;
+    if (normalize_gray8 || state.current_rota != canonical_ur) {
+        const uint8_t grayscale = normalize_gray8 ? RIDDLE_GRAYSCALE_8BIT : KEEP_CURRENT_GRAYSCALE;
+        int rv = fbink_set_fb_info(ctx->fd, canonical_ur, KEEP_CURRENT_BITDEPTH, grayscale, &ctx->base);
         if (rv < 0) {
-            set_error(error, error_len, "cannot switch framebuffer to canonical Gray8");
+            set_error(error, error_len, "cannot switch framebuffer to canonical portrait");
             fbink_close(ctx->fd);
             free(ctx);
             return NULL;
@@ -135,9 +139,14 @@ riddle_kobo_fb *riddle_kobo_fb_open(riddle_kobo_fb_info *info, char *error, size
 
     size_t buffer_size = 0;
     uint8_t *buffer = fbink_get_fb_pointer(ctx->fd, &buffer_size);
-    if (!buffer || !buffer_size || state.bpp != 8 || state.inverted_grayscale ||
-        state.current_rota != canonical_ur) {
-        set_error(error, error_len, "FBInk did not expose canonical normal Gray8");
+    const bool supported_bpp = state.bpp == 8 || state.bpp == 32;
+    const bool bad_gray8 = state.bpp == 8 && state.inverted_grayscale;
+    if (!buffer || !buffer_size || !supported_bpp || bad_gray8 || state.current_rota != canonical_ur) {
+        char message[160];
+        snprintf(message, sizeof(message),
+                 "unsupported framebuffer after normalize (bpp=%u inverted=%u rota=%u expected=%u)",
+                 state.bpp, state.inverted_grayscale ? 1U : 0U, state.current_rota, canonical_ur);
+        set_error(error, error_len, message);
         riddle_kobo_fb_close(ctx);
         return NULL;
     }

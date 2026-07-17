@@ -134,17 +134,25 @@ impl KoboDisplay {
         if ctx.is_null() {
             return Err(ffi_error(&error, "FBInk backend failed"));
         }
-        if info.buffer.is_null() || info.bpp != 8 {
+        if info.buffer.is_null() || (info.bpp != 8 && info.bpp != 32) {
             unsafe { riddle_kobo_fb_close(ctx) };
-            return Err(io::Error::other("FBInk did not expose a Gray8 buffer"));
+            return Err(io::Error::other(format!(
+                "FBInk exposed unsupported {}bpp buffer",
+                info.bpp
+            )));
         }
+        let format = if info.bpp == 8 {
+            PixFmt::Gray8
+        } else {
+            PixFmt::Rgb32
+        };
         let surface = Surface::new(
             info.buffer,
             info.buffer_size,
             info.width as usize,
             info.height as usize,
             info.stride as usize,
-            PixFmt::Gray8,
+            format,
         );
         let display = Self { ctx, info };
         eprintln!(
