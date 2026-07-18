@@ -1,0 +1,17 @@
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id TEXT NOT NULL,
+  image_key TEXT NOT NULL UNIQUE,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS replies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS replies_id_index ON replies(id);

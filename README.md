@@ -67,9 +67,11 @@ are polled by **INBOX** and written back onto the e-ink page.
 
 The mailbox uses two independent capability tokens. Configure the server with
 `MAILBOX_DEVICE_TOKEN` and `MAILBOX_FAMILY_TOKEN`, then put only the device
-token and the HTTPS `MAILBOX_BASE_URL` in the Kobo's `oracle.env`. See
-`server/README.md` for local startup and security notes. Public deployment and
-TLS termination are intentionally separate from the app.
+token and the HTTPS `MAILBOX_BASE_URL` in the Kobo's `oracle.env`. A production
+Cloudflare Worker implementation is deployed at
+`https://ian-mailbox.code4fun.me`; its D1/KV schema, tests, and deployment notes
+live in `worker/README.md`. The standard-library service in `server/` remains
+available for local/LAN hosting and protocol testing.
 
 Chinese and Latin mailbox replies use the bundled **Ma Shan Zheng** handwriting
 font from Google Fonts, licensed under SIL Open Font License 1.1; its license is

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://developers.cloudflare.com/workers/wrangler/config-schema.json",
+  "name": "ian-paper-mailbox",
+  "main": "worker/src/index.js",
+  "compatibility_date": "2026-07-18",
+  "routes": [
+    {
+      "pattern": "ian-mailbox.code4fun.me",
+      "custom_domain": true
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "MAILBOX_DB",
+      "database_name": "ian-paper-mailbox",
+      "database_id": "ef5c07ca-678f-4f8d-a9c6-b8441a89036d",
+      "migrations_dir": "worker/migrations"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "MAILBOX_IMAGES",
+      "id": "8d38c2c79829472b89eb3d035b9ab5a7"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
