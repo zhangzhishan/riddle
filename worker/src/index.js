@@ -5,7 +5,8 @@ const MAX_FORM_BYTES = 32 * 1024;
 const COOKIE_NAME = "mailbox_family";
 const COOKIE_CONTEXT = "paper-plane-family-cookie-v1";
 const PNG_SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-const OPENAI_IMAGES_EDIT_URL = "https://api.openai.com/v1/images/edits";
+const MAI_IMAGES_EDIT_PATH = "/mai/v1/images/edits";
+const MAI_DEFAULT_MODEL = "MAI-Image-2.5";
 const REFINE_PROMPT = `Refine this child's drawing into a polished, colorful children's-book illustration. Preserve the original subject, composition, poses, proportions, line placement, and charming imperfections so it is clearly the same drawing. Clean up the linework, add coherent colors, gentle shading, and a simple supportive background without redesigning it. Do not add text, logos, watermarks, frightening imagery, weapons, or new characters unless they are clearly present in the drawing. Keep it warm, playful, age-appropriate, and use strong value contrast so it remains readable in grayscale.`;
 
 const STYLE = `:root {
@@ -342,7 +343,9 @@ async function handleRefinement(request, env) {
   if (!(await deviceAuthorized(request, env))) {
     throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
   }
-  if (!env.OPENAI_API_KEY) throw new HttpError(503, "image refinement is not configured");
+  if (!env.AZURE_MAI_API_KEY || !env.AZURE_MAI_ENDPOINT) {
+    throw new HttpError(503, "image refinement is not configured");
+  }
   if ((request.headers.get("Content-Type") || "").toLowerCase() !== "image/png") {
     throw new HttpError(415, "Content-Type must be image/png");
   }
@@ -372,9 +375,10 @@ async function handleRefinement(request, env) {
     });
   }
 
+  const model = env.AZURE_MAI_MODEL || MAI_DEFAULT_MODEL;
   const form = new FormData();
-  form.append("model", "gpt-image-2");
-  form.append("image[]", new Blob([payload], { type: "image/png" }), "drawing.png");
+  form.append("model", model);
+  form.append("image", new Blob([payload], { type: "image/png" }), "drawing.png");
   form.append("prompt", REFINE_PROMPT);
   form.append("input_fidelity", "high");
   form.append("quality", "low");
@@ -383,11 +387,12 @@ async function handleRefinement(request, env) {
   form.append("moderation", "auto");
   form.append("n", "1");
 
+  const endpoint = `${env.AZURE_MAI_ENDPOINT.replace(/\/+$/, "")}${MAI_IMAGES_EDIT_PATH}`;
   let upstream;
   try {
-    upstream = await fetch(OPENAI_IMAGES_EDIT_URL, {
+    upstream = await fetch(endpoint, {
       method: "POST",
-      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      headers: { "api-key": env.AZURE_MAI_API_KEY },
       body: form,
     });
   } catch (error) {
@@ -411,7 +416,7 @@ async function handleRefinement(request, env) {
   }
   const refined = decodeBase64Image(result?.data?.[0]?.b64_json);
   await env.MAILBOX_IMAGES.put(cacheKey, refined, {
-    metadata: { contentType: "image/png", model: "gpt-image-2" },
+    metadata: { contentType: "image/png", model },
   });
   return new Response(refined, {
     status: 200,

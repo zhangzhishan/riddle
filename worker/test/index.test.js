@@ -166,29 +166,30 @@ test("protected routes reject invalid credentials before storage access", async 
   assert.equal(upload.headers.get("WWW-Authenticate"), 'Bearer realm="paper-plane-device"');
 });
 
-test("device can refine a PNG through gpt-image-2 and retries use the KV cache", async () => {
+test("device can refine a PNG through MAI-Image-2.5 and retries use the KV cache", async () => {
   const input = makePng();
   const refined = makePng([chunk("tEXt", new TextEncoder().encode("refined"))]);
   const images = memoryKv();
   const refineEnv = {
     ...env,
-    OPENAI_API_KEY: "openai-test-secret",
+    AZURE_MAI_API_KEY: "azure-mai-test-secret",
+    AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com/",
     MAILBOX_IMAGES: images,
   };
   let openAiCalls = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
     openAiCalls += 1;
-    assert.equal(url, "https://api.openai.com/v1/images/edits");
+    assert.equal(url, "https://mai-test.services.ai.azure.com/mai/v1/images/edits");
     assert.equal(options.method, "POST");
-    assert.equal(options.headers.Authorization, "Bearer openai-test-secret");
-    assert.equal(options.body.get("model"), "gpt-image-2");
+    assert.equal(options.headers["api-key"], "azure-mai-test-secret");
+    assert.equal(options.body.get("model"), "MAI-Image-2.5");
     assert.equal(options.body.get("input_fidelity"), "high");
     assert.equal(options.body.get("quality"), "low");
     assert.equal(options.body.get("size"), "1024x1536");
     assert.equal(options.body.get("output_format"), "png");
     assert.match(options.body.get("prompt"), /child.*drawing/i);
-    const image = options.body.get("image[]");
+    const image = options.body.get("image");
     assert.equal(image.type, "image/png");
     assert.deepEqual(new Uint8Array(await image.arrayBuffer()), input);
     return Response.json({
@@ -228,7 +229,7 @@ test("device can refine a PNG through gpt-image-2 and retries use the KV cache",
 test("refine route validates auth, key, and upstream failures", async () => {
   const input = makePng();
   const images = memoryKv();
-  const refineEnv = { ...env, OPENAI_API_KEY: "openai-test-secret", MAILBOX_IMAGES: images };
+  const refineEnv = { ...env, AZURE_MAI_API_KEY: "azure-mai-test-secret", AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com", MAILBOX_IMAGES: images };
   const request = (headers = {}, body = input) => new Request(
     "https://example.test/api/device/refinements",
     { method: "POST", headers, body },
