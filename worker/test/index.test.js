@@ -4,6 +4,7 @@ import test from "node:test";
 import worker, {
   escapeHtml,
   parseContentLength,
+  refinementModels,
   renderIndex,
   safeEqual,
   validatePng,
@@ -166,7 +167,7 @@ test("protected routes reject invalid credentials before storage access", async 
   assert.equal(upload.headers.get("WWW-Authenticate"), 'Bearer realm="paper-plane-device"');
 });
 
-test("device can refine a PNG through MAI-Image-2.5 and retries use the KV cache", async () => {
+test("device can refine a PNG through MAI-Image-2.5-Pro and retries use the KV cache", async () => {
   const input = makePng();
   const refined = makePng([chunk("tEXt", new TextEncoder().encode("refined"))]);
   const images = memoryKv();
@@ -183,7 +184,7 @@ test("device can refine a PNG through MAI-Image-2.5 and retries use the KV cache
     assert.equal(url, "https://mai-test.services.ai.azure.com/mai/v1/images/edits");
     assert.equal(options.method, "POST");
     assert.equal(options.headers["api-key"], "azure-mai-test-secret");
-    assert.equal(options.body.get("model"), "MAI-Image-2.5");
+    assert.equal(options.body.get("model"), "MAI-Image-2.5-Pro");
     assert.equal(options.body.get("input_fidelity"), "high");
     assert.equal(options.body.get("quality"), "low");
     assert.equal(options.body.get("size"), "1024x1536");
@@ -213,6 +214,7 @@ test("device can refine a PNG through MAI-Image-2.5 and retries use the KV cache
     assert.equal(first.status, 200);
     assert.equal(first.headers.get("Content-Type"), "image/png");
     assert.equal(first.headers.get("X-Refinement-Cache"), "miss");
+    assert.equal(first.headers.get("X-Refinement-Model"), "MAI-Image-2.5-Pro");
     assert.deepEqual(new Uint8Array(await first.arrayBuffer()), refined);
 
     const second = await worker.fetch(request(), refineEnv);
@@ -265,4 +267,94 @@ test("refine route validates auth, key, and upstream failures", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test("refinement falls back down the model tiers when capacity is exhausted", async () => {
+  const input = makePng();
+  const refined = makePng([chunk("tEXt", new TextEncoder().encode("flash"))]);
+  const images = memoryKv();
+  const refineEnv = {
+    ...env,
+    AZURE_MAI_API_KEY: "azure-mai-test-secret",
+    AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com",
+    MAILBOX_IMAGES: images,
+  };
+  const attempted = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, options) => {
+    const model = options.body.get("model");
+    attempted.push(model);
+    if (model !== "MAI-Image-2.5-Flash") {
+      return new Response("rate limited", { status: 429 });
+    }
+    return Response.json({ data: [{ b64_json: Buffer.from(refined).toString("base64") }] });
+  };
+  try {
+    const response = await worker.fetch(new Request("https://example.test/api/device/refinements", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer device-secret",
+        "Content-Type": "image/png",
+        "Content-Length": String(input.byteLength),
+        "X-Device-Id": "ian-kobo",
+        "X-Refinement-Key": "abcdef0123456789",
+      },
+      body: input,
+    }), refineEnv);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-Refinement-Model"), "MAI-Image-2.5-Flash");
+    assert.deepEqual(attempted, ["MAI-Image-2.5-Pro", "MAI-Image-2.5", "MAI-Image-2.5-Flash"]);
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), refined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a 400 from the first tier does not waste the fallback tiers", async () => {
+  const input = makePng();
+  const images = memoryKv();
+  const refineEnv = {
+    ...env,
+    AZURE_MAI_API_KEY: "azure-mai-test-secret",
+    AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com",
+    MAILBOX_IMAGES: images,
+  };
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response("moderation blocked", { status: 400 });
+  };
+  try {
+    const response = await worker.fetch(new Request("https://example.test/api/device/refinements", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer device-secret",
+        "Content-Type": "image/png",
+        "Content-Length": String(input.byteLength),
+        "X-Device-Id": "ian-kobo",
+        "X-Refinement-Key": "0f0f0f0f0f0f0f0f",
+      },
+      body: input,
+    }), refineEnv);
+    assert.equal(response.status, 502);
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("AZURE_MAI_MODEL overrides the default tier order", () => {
+  assert.deepEqual(
+    refinementModels({}),
+    ["MAI-Image-2.5-Pro", "MAI-Image-2.5", "MAI-Image-2.5-Flash"],
+  );
+  assert.deepEqual(
+    refinementModels({ AZURE_MAI_MODEL: " MAI-Image-2.5 , MAI-Image-2.5-Flash " }),
+    ["MAI-Image-2.5", "MAI-Image-2.5-Flash"],
+  );
+  assert.deepEqual(
+    refinementModels({ AZURE_MAI_MODEL: "  " }),
+    ["MAI-Image-2.5-Pro", "MAI-Image-2.5", "MAI-Image-2.5-Flash"],
+  );
 });

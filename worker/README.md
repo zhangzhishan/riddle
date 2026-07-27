@@ -8,9 +8,17 @@ This directory contains the production HTTPS implementation of Ian's Paper Plane
 - D1 (`MAILBOX_DB`): message/reply metadata and ordered integer IDs.
 - Workers KV (`MAILBOX_IMAGES`): original PNG bytes (up to 4 MiB each).
 - Custom domain: `https://ian-mailbox.code4fun.me`.
-- Secrets: `MAILBOX_DEVICE_TOKEN`, `MAILBOX_FAMILY_TOKEN`, `AZURE_MAI_API_KEY`, and `AZURE_MAI_ENDPOINT`, stored with Wrangler and never committed. `AZURE_MAI_MODEL` is optional and defaults to `MAI-Image-2.5`.
+- Secrets: `MAILBOX_DEVICE_TOKEN`, `MAILBOX_FAMILY_TOKEN`, `AZURE_MAI_API_KEY`, and `AZURE_MAI_ENDPOINT`, stored with Wrangler and never committed. `AZURE_MAI_MODEL` is optional: a comma-separated tier list that overrides the default `MAI-Image-2.5-Pro,MAI-Image-2.5,MAI-Image-2.5-Flash`.
 
-The Kobo can deliberately request **AI 润色** after drawing. The Worker keeps the Azure credential off the device, calls the Microsoft Foundry image-edit endpoint with `MAI-Image-2.5`, and returns a PNG that the Kobo scales to its grayscale canvas. The original drawing stays intact and reappears when the result is dismissed. A deterministic `X-Refinement-Key` caches successful results in KV, so retrying the same drawing normally does not create another paid image request.
+The Kobo can deliberately request **AI 润色** after drawing. The Worker keeps the Azure credential off the device, calls the Microsoft Foundry image-edit endpoint, and returns a PNG that the Kobo scales to its grayscale canvas. The original drawing stays intact and reappears when the result is dismissed. A deterministic `X-Refinement-Key` caches successful results in KV, so retrying the same drawing normally does not create another paid image request.
+
+Each MAI deployment only carries 2 RPM of preview quota, so refinement walks a
+quality-ordered tier list and steps down on `429`/`5xx`:
+`MAI-Image-2.5-Pro` → `MAI-Image-2.5` → `MAI-Image-2.5-Flash` (6 RPM combined).
+Non-retryable upstream failures such as `400` moderation rejections stop
+immediately instead of burning the cheaper tiers. The tier that produced the
+image is reported in the `X-Refinement-Model` response header and stored in the
+KV entry metadata.
 
 The upstream path is `${AZURE_MAI_ENDPOINT}/mai/v1/images/edits` with an `api-key` header and the image in a form field named `image` (not `image[]`). MAI models are **not** reachable through the `/openai/...` routes — those return intermittent 404/429.
 
@@ -26,7 +34,7 @@ The Python service under `server/` remains useful for local/LAN deployment and t
 - `X-Refinement-Key`: 16 lowercase hexadecimal characters, derived deterministically from the PNG
 - raw PNG request body
 
-Success returns `200 image/png`. `X-Refinement-Cache` is `miss` for a new `MAI-Image-2.5` edit and `hit` when KV supplies a previous successful result. The UI requires two deliberate stylus taps before starting; a failed request preserves the drawing and is retryable.
+Success returns `200 image/png`. `X-Refinement-Cache` is `miss` for a new edit and `hit` when KV supplies a previous successful result; `X-Refinement-Model` names the tier that served it. The UI requires two deliberate stylus taps before starting; a failed request preserves the drawing and is retryable.
 
 ## Test
 
