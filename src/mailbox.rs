@@ -14,16 +14,20 @@ const MAILBOX_FONT_TTF: &[u8] = include_bytes!("../fonts/mailbox/MaShanZheng-Reg
 pub enum Retry {
     Upload,
     Poll,
+    Refine,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
     Compose,
     ConfirmSend,
+    ConfirmRefine,
     ConfirmClear,
     Sending,
+    Refining,
     CheckingInbox,
     Reply { id: u64, body: String },
+    Refined,
     Error { message: String, retry: Retry },
 }
 
@@ -32,15 +36,18 @@ pub enum Action {
     None,
     Draw,
     Upload,
+    Refine,
     Poll { after: u64 },
     ClearCanvas,
     DismissReply,
+    DismissRefinement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeTarget {
     Canvas,
     Send,
+    Refine,
     Inbox,
     Clear,
     Outside,
@@ -71,10 +78,12 @@ impl MailboxState {
         if y < bar_y {
             return ComposeTarget::Canvas;
         }
-        let third = SCREEN_W as i32 / 3;
-        if x < third {
+        let quarter = SCREEN_W as i32 / 4;
+        if x < quarter {
             ComposeTarget::Send
-        } else if x < third * 2 {
+        } else if x < quarter * 2 {
+            ComposeTarget::Refine
+        } else if x < quarter * 3 {
             ComposeTarget::Inbox
         } else {
             ComposeTarget::Clear
@@ -93,6 +102,10 @@ impl MailboxState {
                 ComposeTarget::Canvas => Action::Draw,
                 ComposeTarget::Send if self.has_ink => {
                     self.screen = Screen::ConfirmSend;
+                    Action::None
+                }
+                ComposeTarget::Refine if self.has_ink => {
+                    self.screen = Screen::ConfirmRefine;
                     Action::None
                 }
                 ComposeTarget::Inbox => {
@@ -117,6 +130,15 @@ impl MailboxState {
                     Action::None
                 }
             }
+            Screen::ConfirmRefine => {
+                if confirm_target(x, y) {
+                    self.screen = Screen::Refining;
+                    Action::Refine
+                } else {
+                    self.screen = Screen::Compose;
+                    Action::None
+                }
+            }
             Screen::ConfirmClear => {
                 if confirm_target(x, y) {
                     self.has_ink = false;
@@ -130,6 +152,10 @@ impl MailboxState {
             Screen::Reply { .. } => {
                 self.screen = Screen::Compose;
                 Action::DismissReply
+            }
+            Screen::Refined => {
+                self.screen = Screen::Compose;
+                Action::DismissRefinement
             }
             Screen::Error { retry, .. } => {
                 let retry = *retry;
@@ -146,13 +172,17 @@ impl MailboxState {
                                 after: self.last_reply_id,
                             }
                         }
+                        Retry::Refine => {
+                            self.screen = Screen::Refining;
+                            Action::Refine
+                        }
                     }
                 } else {
                     self.screen = Screen::Compose;
                     Action::None
                 }
             }
-            Screen::Sending | Screen::CheckingInbox => Action::None,
+            Screen::Sending | Screen::Refining | Screen::CheckingInbox => Action::None,
         }
     }
 
@@ -174,6 +204,22 @@ impl MailboxState {
                 Action::None
             }
         }
+    }
+
+    pub fn refine_finished(&mut self, result: Result<(), String>) -> Action {
+        if !matches!(self.screen, Screen::Refining) {
+            return Action::None;
+        }
+        match result {
+            Ok(()) => self.screen = Screen::Refined,
+            Err(message) => {
+                self.screen = Screen::Error {
+                    message,
+                    retry: Retry::Refine,
+                };
+            }
+        }
+        Action::None
     }
 
     pub fn poll_finished(&mut self, result: Result<Option<(u64, String)>, String>) -> Action {
@@ -218,6 +264,84 @@ fn confirm_target(x: i32, y: i32) -> bool {
         && y < SCREEN_H as i32
 }
 
+fn decode_png_luma(bytes: &[u8]) -> std::io::Result<(usize, usize, Vec<u8>)> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder.read_info().map_err(std::io::Error::other)?;
+    let source_info = reader.info();
+    let pixel_count = u64::from(source_info.width) * u64::from(source_info.height);
+    if source_info.width == 0
+        || source_info.height == 0
+        || source_info.width > 4096
+        || source_info.height > 4096
+        || pixel_count > 16 * 1024 * 1024
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refined PNG dimensions are unsafe",
+        ));
+    }
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buffer)
+        .map_err(std::io::Error::other)?;
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refined PNG must decode to 8-bit pixels",
+        ));
+    }
+    let pixels = &buffer[..info.buffer_size()];
+    let mut luma = Vec::with_capacity(info.width as usize * info.height as usize);
+    let blend = |value: u8, alpha: u8| -> u8 {
+        let alpha = u32::from(alpha);
+        ((u32::from(value) * alpha + 255 * (255 - alpha) + 127) / 255) as u8
+    };
+    match info.color_type {
+        png::ColorType::Grayscale => luma.extend_from_slice(pixels),
+        png::ColorType::GrayscaleAlpha => {
+            for pixel in pixels.chunks_exact(2) {
+                luma.push(blend(pixel[0], pixel[1]));
+            }
+        }
+        png::ColorType::Rgb => {
+            for pixel in pixels.chunks_exact(3) {
+                luma.push(
+                    ((u32::from(pixel[0]) * 77
+                        + u32::from(pixel[1]) * 150
+                        + u32::from(pixel[2]) * 29
+                        + 128)
+                        >> 8) as u8,
+                );
+            }
+        }
+        png::ColorType::Rgba => {
+            for pixel in pixels.chunks_exact(4) {
+                let value = ((u32::from(pixel[0]) * 77
+                    + u32::from(pixel[1]) * 150
+                    + u32::from(pixel[2]) * 29
+                    + 128)
+                    >> 8) as u8;
+                luma.push(blend(value, pixel[3]));
+            }
+        }
+        png::ColorType::Indexed => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "refined PNG palette expansion failed",
+            ));
+        }
+    }
+    let expected = info.width as usize * info.height as usize;
+    if luma.len() != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "refined PNG has an invalid pixel buffer",
+        ));
+    }
+    Ok((info.width as usize, info.height as usize, luma))
+}
+
 #[cfg(all(feature = "kobo", target_os = "linux"))]
 pub fn run() -> std::io::Result<()> {
     use crate::fb::BBox;
@@ -233,6 +357,7 @@ pub fn run() -> std::io::Result<()> {
 
     enum NetResult {
         Upload(Result<u64, String>),
+        Refine(Result<(), String>),
         Poll(Result<Option<MailReply>, String>),
     }
 
@@ -259,6 +384,15 @@ pub fn run() -> std::io::Result<()> {
                 .and_then(|client| client.send_png(page))
                 .map_err(|error| error.to_string());
             let _ = tx.send(NetResult::Upload(result));
+        });
+    }
+
+    fn start_refine(tx: mpsc::Sender<NetResult>, page: PathBuf, refined: PathBuf) {
+        std::thread::spawn(move || {
+            let result = MailboxClient::from_env()
+                .and_then(|client| client.refine_png(page, refined))
+                .map_err(|error| error.to_string());
+            let _ = tx.send(NetResult::Refine(result));
         });
     }
 
@@ -303,17 +437,24 @@ pub fn run() -> std::io::Result<()> {
         surf.fill_rect(0, y, SCREEN_W, 3, BLACK);
         match &state.screen {
             Screen::Compose => {
-                let third = SCREEN_W / 3;
-                surf.fill_rect(third, y, 2, ACTION_BAR_H as usize, BLACK);
-                surf.fill_rect(third * 2, y, 2, ACTION_BAR_H as usize, BLACK);
-                draw_text(surf, font, "发送", 56.0, third / 2, y + 50);
-                draw_text(surf, font, "收信", 56.0, third + third / 2, y + 50);
-                draw_text(surf, font, "清空", 56.0, third * 2 + third / 2, y + 50);
+                let quarter = SCREEN_W / 4;
+                for divider in 1..4 {
+                    surf.fill_rect(quarter * divider, y, 2, ACTION_BAR_H as usize, BLACK);
+                }
+                draw_text(surf, font, "发送", 48.0, quarter / 2, y + 56);
+                draw_text(surf, font, "AI润色", 48.0, quarter + quarter / 2, y + 56);
+                draw_text(surf, font, "收信", 48.0, quarter * 2 + quarter / 2, y + 56);
+                draw_text(surf, font, "清空", 48.0, quarter * 3 + quarter / 2, y + 56);
             }
             Screen::ConfirmSend => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
                 draw_text(surf, font, "取消", 52.0, SCREEN_W / 4, y + 50);
                 draw_text(surf, font, "现在发送", 52.0, SCREEN_W * 3 / 4, y + 50);
+            }
+            Screen::ConfirmRefine => {
+                surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
+                draw_text(surf, font, "取消", 52.0, SCREEN_W / 4, y + 50);
+                draw_text(surf, font, "开始润色", 52.0, SCREEN_W * 3 / 4, y + 50);
             }
             Screen::ConfirmClear => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
@@ -321,6 +462,14 @@ pub fn run() -> std::io::Result<()> {
                 draw_text(surf, font, "清空画纸", 52.0, SCREEN_W * 3 / 4, y + 50);
             }
             Screen::Sending => draw_text(surf, font, "正在折纸飞机……", 52.0, SCREEN_W / 2, y + 50),
+            Screen::Refining => draw_text(
+                surf,
+                font,
+                "GPT 正在认真润色，大约要一两分钟……",
+                38.0,
+                SCREEN_W / 2,
+                y + 58,
+            ),
             Screen::CheckingInbox => draw_text(
                 surf,
                 font,
@@ -332,6 +481,14 @@ pub fn run() -> std::io::Result<()> {
             Screen::Reply { .. } => {
                 draw_text(surf, font, "点一下回到画纸", 48.0, SCREEN_W / 2, y + 56)
             }
+            Screen::Refined => draw_text(
+                surf,
+                font,
+                "AI 润色完成 · 点一下回到原画",
+                42.0,
+                SCREEN_W / 2,
+                y + 60,
+            ),
             Screen::Error { message, .. } => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
                 let short: String = message.chars().take(34).collect();
@@ -389,6 +546,41 @@ pub fn run() -> std::io::Result<()> {
         }
     }
 
+    fn render_refined_png(surf: &mut Surface, path: &Path) -> std::io::Result<()> {
+        let bytes = std::fs::read(path)?;
+        let (source_w, source_h, pixels) = decode_png_luma(&bytes)?;
+        if source_w == 0 || source_h == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "refined PNG has zero dimensions",
+            ));
+        }
+        let canvas_h = SCREEN_H - ACTION_BAR_H as usize;
+        let max_w = SCREEN_W.saturating_sub(40).max(1);
+        let max_h = canvas_h.saturating_sub(40).max(1);
+        let (target_w, target_h) =
+            if max_w.saturating_mul(source_h) <= max_h.saturating_mul(source_w) {
+                (max_w, (source_h.saturating_mul(max_w) / source_w).max(1))
+            } else {
+                ((source_w.saturating_mul(max_h) / source_h).max(1), max_h)
+            };
+        let x0 = (SCREEN_W - target_w) / 2;
+        let y0 = (canvas_h - target_h) / 2;
+        surf.fill_rect(0, 0, SCREEN_W, canvas_h, WHITE);
+        for y in 0..target_h {
+            let source_y = y.saturating_mul(source_h) / target_h;
+            for x in 0..target_w {
+                let source_x = x.saturating_mul(source_w) / target_w;
+                let value = pixels[source_y * source_w + source_x];
+                let red = (u16::from(value) * 31 / 255) << 11;
+                let green = (u16::from(value) * 63 / 255) << 5;
+                let blue = u16::from(value) * 31 / 255;
+                surf.put_px((x0 + x) as i32, (y0 + y) as i32, red | green | blue);
+            }
+        }
+        Ok(())
+    }
+
     fn wrap_reply(font: &FontRef, text: &str, px: f32, max_width: f32) -> Vec<String> {
         let mut lines = Vec::new();
         let mut current = String::new();
@@ -416,6 +608,7 @@ pub fn run() -> std::io::Result<()> {
     let outbox = outbox_dir();
     std::fs::create_dir_all(&outbox)?;
     let page_path = outbox.join("pending.png");
+    let refined_path = outbox.join("refined.png");
     let started = Instant::now();
     let mut state = MailboxState::new(read_last_reply(&outbox), 0);
     let mut ink = Ink::new();
@@ -455,6 +648,22 @@ pub fn run() -> std::io::Result<()> {
                     false,
                 );
             }
+            Action::Refine => {
+                *snapshot = Some(surface.copy_rect(0, 0, SCREEN_W, SCREEN_H));
+                if let Err(error) = ink.to_png(surface, page_path.to_str().unwrap()) {
+                    state.refine_finished(Err(error.to_string()));
+                } else {
+                    start_refine(net_tx.clone(), page_path.clone(), refined_path.clone());
+                }
+                render_controls(surface, &font, state);
+                display.update(
+                    0,
+                    SCREEN_H as i32 - ACTION_BAR_H,
+                    SCREEN_W as i32,
+                    ACTION_BAR_H,
+                    false,
+                );
+            }
             Action::Poll { after } => {
                 start_poll(net_tx.clone(), after);
                 render_controls(surface, &font, state);
@@ -468,12 +677,13 @@ pub fn run() -> std::io::Result<()> {
             }
             Action::ClearCanvas => {
                 ink.clear();
+                snapshot.take();
                 render_compose_shell(surface, &font);
                 render_controls(surface, &font, state);
                 display.full_refresh(SCREEN_W, SCREEN_H);
                 let _ = std::fs::remove_file(&page_path);
             }
-            Action::DismissReply => {
+            Action::DismissReply | Action::DismissRefinement => {
                 if let Some(saved) = snapshot.take() {
                     surface.paste_rect(0, 0, SCREEN_W, SCREEN_H, &saved);
                 } else {
@@ -509,6 +719,25 @@ pub fn run() -> std::io::Result<()> {
                         &display,
                         &mut compose_snapshot,
                     );
+                }
+                NetResult::Refine(result) => {
+                    let result = result.and_then(|()| {
+                        render_refined_png(&mut surface, &refined_path)
+                            .map_err(|error| error.to_string())
+                    });
+                    state.refine_finished(result);
+                    render_controls(&mut surface, &font, &state);
+                    if matches!(state.screen, Screen::Refined) {
+                        display.full_refresh(SCREEN_W, SCREEN_H);
+                    } else {
+                        display.update(
+                            0,
+                            SCREEN_H as i32 - ACTION_BAR_H,
+                            SCREEN_W as i32,
+                            ACTION_BAR_H,
+                            false,
+                        );
+                    }
                 }
                 NetResult::Poll(result) => {
                     let result = result.map(|reply| reply.map(|reply| (reply.id, reply.body)));
@@ -630,9 +859,10 @@ mod tests {
     fn center(target: ComposeTarget) -> (i32, i32) {
         let y = SCREEN_H as i32 - ACTION_BAR_H / 2;
         match target {
-            ComposeTarget::Send => (SCREEN_W as i32 / 6, y),
-            ComposeTarget::Inbox => (SCREEN_W as i32 / 2, y),
-            ComposeTarget::Clear => (SCREEN_W as i32 * 5 / 6, y),
+            ComposeTarget::Send => (SCREEN_W as i32 / 8, y),
+            ComposeTarget::Refine => (SCREEN_W as i32 * 3 / 8, y),
+            ComposeTarget::Inbox => (SCREEN_W as i32 * 5 / 8, y),
+            ComposeTarget::Clear => (SCREEN_W as i32 * 7 / 8, y),
             ComposeTarget::Canvas => (SCREEN_W as i32 / 2, 200),
             ComposeTarget::Outside => (-1, -1),
         }
@@ -650,6 +880,7 @@ mod tests {
         );
         for target in [
             ComposeTarget::Send,
+            ComposeTarget::Refine,
             ComposeTarget::Inbox,
             ComposeTarget::Clear,
         ] {
@@ -681,6 +912,40 @@ mod tests {
         assert_eq!(state.tap(10, 10, 0), Action::None);
         assert_eq!(state.screen, Screen::Compose);
         assert!(state.has_ink);
+    }
+
+    #[test]
+    fn refine_requires_confirmation_preserves_ink_and_can_be_dismissed_or_retried() {
+        let mut state = MailboxState::new(0, 0);
+        let (x, y) = center(ComposeTarget::Refine);
+        assert_eq!(state.tap(x, y, 0), Action::None);
+        assert_eq!(state.screen, Screen::Compose);
+
+        state.note_ink();
+        assert_eq!(state.tap(x, y, 0), Action::None);
+        assert_eq!(state.screen, Screen::ConfirmRefine);
+        let (x, y) = confirm();
+        assert_eq!(state.tap(x, y, 0), Action::Refine);
+        assert_eq!(state.screen, Screen::Refining);
+        assert_eq!(state.refine_finished(Ok(())), Action::None);
+        assert_eq!(state.screen, Screen::Refined);
+        assert!(state.has_ink);
+        assert_eq!(state.tap(200, 200, 1), Action::DismissRefinement);
+        assert_eq!(state.screen, Screen::Compose);
+        assert!(state.has_ink);
+
+        state.screen = Screen::Refining;
+        state.refine_finished(Err("offline".into()));
+        assert_eq!(
+            state.screen,
+            Screen::Error {
+                message: "offline".into(),
+                retry: Retry::Refine,
+            }
+        );
+        let (x, y) = confirm();
+        assert_eq!(state.tap(x, y, 2), Action::Refine);
+        assert_eq!(state.screen, Screen::Refining);
     }
 
     #[test]
@@ -749,6 +1014,39 @@ mod tests {
         assert_eq!(state.tick(59_999), Action::None);
         assert_eq!(state.tick(60_000), Action::Poll { after: 8 });
         assert!(state.has_ink);
+    }
+
+    #[test]
+    fn decode_png_luma_converts_rgb_pixels_for_eink() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 2, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer
+                .write_image_data(&[255, 0, 0, 255, 255, 255])
+                .unwrap();
+        }
+        let (width, height, pixels) = decode_png_luma(&encoded).unwrap();
+        assert_eq!((width, height), (2, 1));
+        assert!((75..=78).contains(&pixels[0]));
+        assert_eq!(pixels[1], 255);
+    }
+
+    #[test]
+    fn decode_png_luma_rejects_unsafe_dimensions_before_allocating() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 5000, 1);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&vec![255; 5000]).unwrap();
+        }
+        let error = decode_png_luma(&encoded).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("dimensions"));
     }
 
     #[test]

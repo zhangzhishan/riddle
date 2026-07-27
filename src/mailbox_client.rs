@@ -5,12 +5,13 @@
 //! can be exercised on the host before installing anything on the Kobo.
 
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::Duration;
 
 const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLY_BYTES: u64 = 8 * 1024;
+const MAX_REFINED_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -64,7 +65,7 @@ impl MailboxClient {
         }
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(30))
+            .timeout_read(Duration::from_secs(180))
             .timeout_write(Duration::from_secs(30))
             .build();
         Ok(Self {
@@ -110,6 +111,88 @@ impl MailboxClient {
                 "mailbox upload returned an invalid message ID",
             )
         })
+    }
+
+    pub fn refine_png(
+        &self,
+        input_path: impl AsRef<Path>,
+        output_path: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        let png = fs::read(input_path)?;
+        if png.len() > MAX_PAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refinement input exceeds 4 MiB",
+            ));
+        }
+        if !is_png(&png) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refinement input is not a PNG",
+            ));
+        }
+        let response = self
+            .agent
+            .post(&format!("{}/api/device/refinements", self.base_url))
+            .set("Authorization", &format!("Bearer {}", self.device_token))
+            .set("Content-Type", "image/png")
+            .set("X-Device-Id", &self.device_id)
+            .set("X-Refinement-Key", &refinement_key(&png))
+            .send_bytes(&png)
+            .map_err(http_error)?;
+        let content_type = response
+            .header("Content-Type")
+            .unwrap_or_default()
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim();
+        if content_type != "image/png" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refinement response is not image/png",
+            ));
+        }
+        if response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > MAX_REFINED_IMAGE_BYTES)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refinement response exceeds 16 MiB",
+            ));
+        }
+        let mut refined = Vec::new();
+        response
+            .into_reader()
+            .take(MAX_REFINED_IMAGE_BYTES + 1)
+            .read_to_end(&mut refined)?;
+        if refined.len() as u64 > MAX_REFINED_IMAGE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refinement response exceeds 16 MiB",
+            ));
+        }
+        if !is_png(&refined) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refinement response is not a PNG",
+            ));
+        }
+
+        let output_path = output_path.as_ref();
+        let temp_path = output_path.with_extension("png.part");
+        let write_result = (|| {
+            let mut file = fs::File::create(&temp_path)?;
+            file.write_all(&refined)?;
+            file.sync_all()?;
+            fs::rename(&temp_path, output_path)
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_result
     }
 
     pub fn poll_reply(&self, after: u64) -> io::Result<Option<Reply>> {
@@ -174,6 +257,15 @@ fn required_env(name: &str) -> io::Result<String> {
 
 fn is_png(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+}
+
+fn refinement_key(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn http_error(error: ureq::Error) -> io::Error {
@@ -325,6 +417,51 @@ mod tests {
         let error = client.poll_reply(0).unwrap_err().to_string();
         assert!(error.contains("HTTP 401"));
         assert!(!error.contains("very-secret"));
+    }
+
+    #[test]
+    fn refines_png_with_stable_key_and_writes_returned_png() {
+        let refined = test_png();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            refined.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(refined.iter().copied())
+        .collect::<Vec<_>>();
+        let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+        let (base, requests) = mock_server(response);
+        let suffix = format!("{}-{}", std::process::id(), refinement_key(&test_png()));
+        let input = std::env::temp_dir().join(format!("mailbox-refine-input-{suffix}.png"));
+        let output = std::env::temp_dir().join(format!("mailbox-refine-output-{suffix}.png"));
+        fs::write(&input, test_png()).unwrap();
+
+        let client = MailboxClient::new(base, "secret-device", "ian-kobo").unwrap();
+        client.refine_png(&input, &output).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), refined);
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(request
+            .head
+            .starts_with("POST /api/device/refinements HTTP/1.1\r\n"));
+        assert!(request.head.contains("Authorization: Bearer "));
+        assert!(request.head.contains("Content-Type: image/png\r\n"));
+        assert!(request.head.contains("X-Device-Id: ian-kobo\r\n"));
+        assert!(request.head.contains(&format!(
+            "X-Refinement-Key: {}\r\n",
+            refinement_key(&test_png())
+        )));
+        assert_eq!(request.body, test_png());
+        let _ = fs::remove_file(input);
+        let _ = fs::remove_file(output);
+    }
+
+    #[test]
+    fn refinement_key_is_stable_and_sensitive_to_image_bytes() {
+        assert_eq!(refinement_key(&test_png()), refinement_key(&test_png()));
+        let mut changed = test_png();
+        changed.push(1);
+        assert_ne!(refinement_key(&test_png()), refinement_key(&changed));
     }
 
     #[test]

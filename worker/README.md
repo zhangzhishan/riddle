@@ -8,9 +8,23 @@ This directory contains the production HTTPS implementation of Ian's Paper Plane
 - D1 (`MAILBOX_DB`): message/reply metadata and ordered integer IDs.
 - Workers KV (`MAILBOX_IMAGES`): original PNG bytes (up to 4 MiB each).
 - Custom domain: `https://ian-mailbox.code4fun.me`.
-- Secrets: `MAILBOX_DEVICE_TOKEN` and `MAILBOX_FAMILY_TOKEN`, stored with Wrangler and never committed.
+- Secrets: `MAILBOX_DEVICE_TOKEN`, `MAILBOX_FAMILY_TOKEN`, and `OPENAI_API_KEY`, stored with Wrangler and never committed.
 
-The Python service under `server/` remains useful for local/LAN deployment and protocol tests. The Worker exposes the same device and family routes so the Kobo client does not need a Cloudflare-specific protocol.
+The Kobo can deliberately request **AI 润色** after drawing. The Worker keeps the OpenAI credential off the device, calls the single-image edit endpoint with `gpt-image-2`, and returns a PNG that the Kobo scales to its grayscale canvas. The original drawing stays intact and reappears when the result is dismissed. A deterministic `X-Refinement-Key` caches successful results in KV, so retrying the same drawing normally does not create another paid image request.
+
+The Python service under `server/` remains useful for local/LAN deployment and the original mailbox protocol tests. Upload, reply, family, and health routes stay compatible between both implementations; AI refinement is provided by the production Worker because that is where the OpenAI secret and result cache live.
+
+## Device refinement protocol
+
+`POST /api/device/refinements` requires the normal device bearer token plus:
+
+- `Content-Type: image/png`
+- `Content-Length` up to 4 MiB
+- `X-Device-Id`
+- `X-Refinement-Key`: 16 lowercase hexadecimal characters, derived deterministically from the PNG
+- raw PNG request body
+
+Success returns `200 image/png`. `X-Refinement-Cache` is `miss` for a new `gpt-image-2` edit and `hit` when KV supplies a previous successful result. The UI requires two deliberate stylus taps before starting; a failed request preserves the drawing and is retryable.
 
 ## Test
 
@@ -32,6 +46,7 @@ npx wrangler d1 migrations apply ian-paper-mailbox --remote
 npx wrangler deploy
 npx wrangler secret put MAILBOX_DEVICE_TOKEN
 npx wrangler secret put MAILBOX_FAMILY_TOKEN
+npx wrangler secret put OPENAI_API_KEY
 curl -fsS https://ian-mailbox.code4fun.me/healthz
 ```
 

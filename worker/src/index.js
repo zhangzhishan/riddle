@@ -1,9 +1,12 @@
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+const MAX_REFINED_IMAGE_BYTES = 16 * 1024 * 1024;
 const MAX_REPLY_CHARACTERS = 2000;
 const MAX_FORM_BYTES = 32 * 1024;
 const COOKIE_NAME = "mailbox_family";
 const COOKIE_CONTEXT = "paper-plane-family-cookie-v1";
 const PNG_SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const OPENAI_IMAGES_EDIT_URL = "https://api.openai.com/v1/images/edits";
+const REFINE_PROMPT = `Refine this child's drawing into a polished, colorful children's-book illustration. Preserve the original subject, composition, poses, proportions, line placement, and charming imperfections so it is clearly the same drawing. Clean up the linework, add coherent colors, gentle shading, and a simple supportive background without redesigning it. Do not add text, logos, watermarks, frightening imagery, weapons, or new characters unless they are clearly present in the drawing. Keep it warm, playful, age-appropriate, and use strong value contrast so it remains readable in grayscale.`;
 
 const STYLE = `:root {
   color-scheme: light;
@@ -117,9 +120,9 @@ function readU32(bytes, offset) {
   ) >>> 0;
 }
 
-export function validatePng(input) {
+export function validatePng(input, maximum = MAX_IMAGE_BYTES) {
   const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
-  if (bytes.byteLength > MAX_IMAGE_BYTES) throw new Error("image exceeds the 4 MiB limit");
+  if (bytes.byteLength > maximum) throw new Error("image exceeds the size limit");
   if (bytes.byteLength < PNG_SIGNATURE.length) throw new Error("invalid PNG signature");
   for (let i = 0; i < PNG_SIGNATURE.length; i += 1) {
     if (bytes[i] !== PNG_SIGNATURE[i]) throw new Error("invalid PNG signature");
@@ -277,6 +280,31 @@ function utcTimestamp() {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
+function decodeBase64Image(value) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new HttpError(502, "image refinement returned no image");
+  }
+  if (value.length > Math.ceil(MAX_REFINED_IMAGE_BYTES / 3) * 4 + 8) {
+    throw new HttpError(502, "image refinement returned an oversized image");
+  }
+  let binary;
+  try {
+    binary = atob(value);
+  } catch {
+    throw new HttpError(502, "image refinement returned invalid image data");
+  }
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  try {
+    validatePng(bytes, MAX_REFINED_IMAGE_BYTES);
+  } catch {
+    throw new HttpError(502, "image refinement returned an invalid PNG");
+  }
+  return bytes;
+}
+
 async function handleUpload(request, env) {
   if (!(await deviceAuthorized(request, env))) {
     throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
@@ -308,6 +336,87 @@ async function handleUpload(request, env) {
     await env.MAILBOX_IMAGES.delete(imageKey);
     throw error;
   }
+}
+
+async function handleRefinement(request, env) {
+  if (!(await deviceAuthorized(request, env))) {
+    throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
+  }
+  if (!env.OPENAI_API_KEY) throw new HttpError(503, "image refinement is not configured");
+  if ((request.headers.get("Content-Type") || "").toLowerCase() !== "image/png") {
+    throw new HttpError(415, "Content-Type must be image/png");
+  }
+  const deviceId = request.headers.get("X-Device-Id") || "";
+  if (!deviceId.trim() || deviceId.length > 200 || /[\r\n]/.test(deviceId)) {
+    throw new HttpError(400, "device ID must not be empty or invalid");
+  }
+  const refinementKey = request.headers.get("X-Refinement-Key") || "";
+  if (!/^[a-f0-9]{16}$/.test(refinementKey)) {
+    throw new HttpError(400, "X-Refinement-Key must be 16 lowercase hexadecimal characters");
+  }
+  const declaredLength = parseContentLength(request, MAX_IMAGE_BYTES);
+  const payload = new Uint8Array(await request.arrayBuffer());
+  if (payload.byteLength !== declaredLength) throw new HttpError(400, "incomplete request body");
+  try {
+    validatePng(payload);
+  } catch (error) {
+    throw new HttpError(400, error.message);
+  }
+
+  const cacheKey = `refinements/${encodeURIComponent(deviceId)}/${refinementKey}.png`;
+  const cached = await env.MAILBOX_IMAGES.get(cacheKey, "arrayBuffer");
+  if (cached) {
+    return new Response(cached, {
+      status: 200,
+      headers: responseHeaders("image/png", { "X-Refinement-Cache": "hit" }),
+    });
+  }
+
+  const form = new FormData();
+  form.append("model", "gpt-image-2");
+  form.append("image[]", new Blob([payload], { type: "image/png" }), "drawing.png");
+  form.append("prompt", REFINE_PROMPT);
+  form.append("input_fidelity", "high");
+  form.append("quality", "low");
+  form.append("size", "1024x1536");
+  form.append("output_format", "png");
+  form.append("moderation", "auto");
+  form.append("n", "1");
+
+  let upstream;
+  try {
+    upstream = await fetch(OPENAI_IMAGES_EDIT_URL, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: form,
+    });
+  } catch (error) {
+    console.error("image refinement request failed", error?.message || String(error));
+    throw new HttpError(502, "image refinement failed");
+  }
+  if (!upstream.ok) {
+    console.error(
+      "image refinement upstream error",
+      upstream.status,
+      upstream.headers.get("x-request-id") || "no-request-id",
+    );
+    throw new HttpError(502, "image refinement failed");
+  }
+
+  let result;
+  try {
+    result = await upstream.json();
+  } catch {
+    throw new HttpError(502, "image refinement returned invalid JSON");
+  }
+  const refined = decodeBase64Image(result?.data?.[0]?.b64_json);
+  await env.MAILBOX_IMAGES.put(cacheKey, refined, {
+    metadata: { contentType: "image/png", model: "gpt-image-2" },
+  });
+  return new Response(refined, {
+    status: 200,
+    headers: responseHeaders("image/png", { "X-Refinement-Cache": "miss" }),
+  });
 }
 
 async function handlePoll(request, env, url) {
@@ -465,6 +574,9 @@ async function handleRequest(request, env) {
   }
   if (request.method === "POST" && url.pathname === "/api/device/messages" && url.search === "") {
     return handleUpload(request, env);
+  }
+  if (request.method === "POST" && url.pathname === "/api/device/refinements" && url.search === "") {
+    return handleRefinement(request, env);
   }
   if (request.method === "GET" && url.pathname === "/api/device/replies") {
     return handlePoll(request, env, url);

@@ -61,6 +61,27 @@ const env = {
   MAILBOX_FAMILY_TOKEN: "family-secret",
 };
 
+function memoryKv() {
+  const values = new Map();
+  return {
+    values,
+    async get(key, type) {
+      const value = values.get(key);
+      if (value == null) return null;
+      if (type === "arrayBuffer") {
+        return value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+      }
+      return value;
+    },
+    async put(key, value) {
+      values.set(key, new Uint8Array(value));
+    },
+    async delete(key) {
+      values.delete(key);
+    },
+  };
+}
+
 test("PNG validator accepts a complete PNG", () => {
   assert.doesNotThrow(() => validatePng(makePng()));
 });
@@ -143,4 +164,104 @@ test("protected routes reject invalid credentials before storage access", async 
   }), env);
   assert.equal(upload.status, 401);
   assert.equal(upload.headers.get("WWW-Authenticate"), 'Bearer realm="paper-plane-device"');
+});
+
+test("device can refine a PNG through gpt-image-2 and retries use the KV cache", async () => {
+  const input = makePng();
+  const refined = makePng([chunk("tEXt", new TextEncoder().encode("refined"))]);
+  const images = memoryKv();
+  const refineEnv = {
+    ...env,
+    OPENAI_API_KEY: "openai-test-secret",
+    MAILBOX_IMAGES: images,
+  };
+  let openAiCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    openAiCalls += 1;
+    assert.equal(url, "https://api.openai.com/v1/images/edits");
+    assert.equal(options.method, "POST");
+    assert.equal(options.headers.Authorization, "Bearer openai-test-secret");
+    assert.equal(options.body.get("model"), "gpt-image-2");
+    assert.equal(options.body.get("input_fidelity"), "high");
+    assert.equal(options.body.get("quality"), "low");
+    assert.equal(options.body.get("size"), "1024x1536");
+    assert.equal(options.body.get("output_format"), "png");
+    assert.match(options.body.get("prompt"), /child.*drawing/i);
+    const image = options.body.get("image[]");
+    assert.equal(image.type, "image/png");
+    assert.deepEqual(new Uint8Array(await image.arrayBuffer()), input);
+    return Response.json({
+      data: [{ b64_json: Buffer.from(refined).toString("base64") }],
+    }, { headers: { "x-request-id": "req_test" } });
+  };
+
+  try {
+    const request = () => new Request("https://example.test/api/device/refinements", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer device-secret",
+        "Content-Type": "image/png",
+        "Content-Length": String(input.byteLength),
+        "X-Device-Id": "ian-kobo",
+        "X-Refinement-Key": "0123456789abcdef",
+      },
+      body: input,
+    });
+    const first = await worker.fetch(request(), refineEnv);
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get("Content-Type"), "image/png");
+    assert.equal(first.headers.get("X-Refinement-Cache"), "miss");
+    assert.deepEqual(new Uint8Array(await first.arrayBuffer()), refined);
+
+    const second = await worker.fetch(request(), refineEnv);
+    assert.equal(second.status, 200);
+    assert.equal(second.headers.get("X-Refinement-Cache"), "hit");
+    assert.deepEqual(new Uint8Array(await second.arrayBuffer()), refined);
+    assert.equal(openAiCalls, 1);
+    assert.deepEqual(images.values.get("refinements/ian-kobo/0123456789abcdef.png"), refined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("refine route validates auth, key, and upstream failures", async () => {
+  const input = makePng();
+  const images = memoryKv();
+  const refineEnv = { ...env, OPENAI_API_KEY: "openai-test-secret", MAILBOX_IMAGES: images };
+  const request = (headers = {}, body = input) => new Request(
+    "https://example.test/api/device/refinements",
+    { method: "POST", headers, body },
+  );
+
+  const unauthorized = await worker.fetch(request({ "Content-Length": String(input.length) }), refineEnv);
+  assert.equal(unauthorized.status, 401);
+
+  const badKey = await worker.fetch(request({
+    Authorization: "Bearer device-secret",
+    "Content-Type": "image/png",
+    "Content-Length": String(input.length),
+    "X-Device-Id": "ian-kobo",
+    "X-Refinement-Key": "not-safe",
+  }), refineEnv);
+  assert.equal(badKey.status, 400);
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("upstream detail must stay private", {
+    status: 429,
+    headers: { "x-request-id": "req_rate_limit" },
+  });
+  try {
+    const upstream = await worker.fetch(request({
+      Authorization: "Bearer device-secret",
+      "Content-Type": "image/png",
+      "Content-Length": String(input.length),
+      "X-Device-Id": "ian-kobo",
+      "X-Refinement-Key": "fedcba9876543210",
+    }), refineEnv);
+    assert.equal(upstream.status, 502);
+    assert.equal(await upstream.text(), "image refinement failed\n");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
