@@ -105,6 +105,15 @@ button:focus-visible, textarea:focus-visible { outline: 3px solid #edac4d; outli
 .refinement-pair figure { margin: 0; min-width: 0; }
 .refinement-pair figcaption { padding: 0.65rem 1rem; font-weight: 750; background: #f7f2e8; }
 .refinement-pair img { border-block: 1px solid #e5dfd4; }
+.missing-input {
+  display: grid;
+  min-height: 14rem;
+  place-items: center;
+  padding: 1.5rem;
+  background: #eee8dc;
+  color: #666057;
+  text-align: center;
+}
 .model { padding: 0.8rem 1rem; color: #666057; font-size: 0.86rem; }
 .empty { padding: 2rem; border-radius: 1rem; background: #fffdf8; text-align: center; }
 @media (min-width: 40rem) {
@@ -696,7 +705,7 @@ async function handleReply(request, env, messageId) {
 async function handleRefinementHistory(request, env) {
   if (!(await familyAuthorized(request, env))) throw new HttpError(403, "forbidden");
   const query = await env.MAILBOX_DB.prepare(
-    `SELECT id, device_id, model, created_at
+    `SELECT id, device_id, model, created_at, input_available
      FROM refinements
      ORDER BY id DESC`,
   ).all();
@@ -711,9 +720,11 @@ async function handleRefinementHistory(request, env) {
 async function handleRefinementImage(request, env, refinementId, side) {
   if (!(await familyAuthorized(request, env))) throw new HttpError(403, "forbidden");
   const row = await env.MAILBOX_DB.prepare(
-    "SELECT input_key, output_key FROM refinements WHERE id = ?",
+    "SELECT input_key, output_key, input_available FROM refinements WHERE id = ?",
   ).bind(refinementId).first();
-  if (!row) throw new HttpError(404, "not found");
+  if (!row || (side === "input" && Number(row.input_available) === 0)) {
+    throw new HttpError(404, "not found");
+  }
   const key = side === "input" ? row.input_key : row.output_key;
   const image = await env.MAILBOX_IMAGES.get(key, "arrayBuffer");
   if (!image) throw new HttpError(404, "not found");
@@ -725,11 +736,15 @@ export function renderRefinementHistory(refinements) {
     const id = Number(item.id);
     const device = escapeHtml(item.device_id);
     const model = escapeHtml(item.model);
-    const created = escapeHtml(item.created_at);
+    const legacy = Number(item.input_available) === 0;
+    const created = legacy ? "旧版记录" : escapeHtml(item.created_at);
+    const input = legacy
+      ? `<figure><figcaption>发给 AI 的原图</figcaption><div class="missing-input">旧版本当时没有保存原图</div></figure>`
+      : `<figure><figcaption>发给 AI 的原图</figcaption><img src="/refinements/${id}/input.png" alt="第 ${id} 次 AI 创作的输入图" loading="lazy"></figure>`;
     return `<article class="message-card" id="refinement-${id}">
-      <header><span>来自 ${device}</span><time datetime="${created}">${created}</time></header>
+      <header><span>来自 ${device}</span><time>${created}</time></header>
       <div class="refinement-pair">
-        <figure><figcaption>发给 AI 的原图</figcaption><img src="/refinements/${id}/input.png" alt="第 ${id} 次 AI 创作的输入图" loading="lazy"></figure>
+        ${input}
         <figure><figcaption>AI 生成的图片</figcaption><img src="/refinements/${id}/output.png" alt="第 ${id} 次 AI 创作的结果图" loading="lazy"></figure>
       </div>
       <div class="model">模型：${model}</div>

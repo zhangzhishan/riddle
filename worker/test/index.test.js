@@ -86,6 +86,7 @@ function memoryRefinementDb() {
               output_key,
               model,
               created_at,
+              input_available: 1,
             });
           }
           return { success: true };
@@ -206,6 +207,7 @@ test("refinement history renders protected before-and-after pairs safely", () =>
     device_id: "ian<script>",
     model: "MAI<Pro>",
     created_at: "2026-07-27T12:00:00Z",
+    input_available: 1,
   }]);
   assert.match(html, /发给 AI 的原图/);
   assert.match(html, /AI 生成的图片/);
@@ -214,6 +216,17 @@ test("refinement history renders protected before-and-after pairs safely", () =>
   assert.match(html, /ian&lt;script&gt;/);
   assert.match(html, /MAI&lt;Pro&gt;/);
   assert.doesNotMatch(html, /ian<script>/);
+
+  const legacy = renderRefinementHistory([{
+    id: 8,
+    device_id: "ian-kobo",
+    model: "gpt-image-2",
+    created_at: "legacy",
+    input_available: 0,
+  }]);
+  assert.match(legacy, /旧版本当时没有保存原图/);
+  assert.doesNotMatch(legacy, /\/refinements\/8\/input\.png/);
+  assert.match(legacy, /\/refinements\/8\/output\.png/);
 });
 
 test("public health and generic method handling return hardened responses", async () => {
@@ -261,6 +274,7 @@ test("family can browse protected refinement history and both images", async () 
     output_key: "history/output.png",
     model: "MAI-Image-2.5-Pro",
     created_at: "2026-07-27T12:00:00Z",
+    input_available: 1,
   });
   await images.put("history/input.png", input);
   await images.put("history/output.png", output);
