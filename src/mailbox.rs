@@ -41,6 +41,7 @@ pub enum Action {
     ClearCanvas,
     DismissReply,
     DismissRefinement,
+    AdoptRefinement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,7 +156,12 @@ impl MailboxState {
             }
             Screen::Refined => {
                 self.screen = Screen::Compose;
-                Action::DismissRefinement
+                if confirm_target(x, y) {
+                    self.has_ink = true;
+                    Action::AdoptRefinement
+                } else {
+                    Action::DismissRefinement
+                }
             }
             Screen::Error { retry, .. } => {
                 let retry = *retry;
@@ -342,6 +348,52 @@ fn decode_png_luma(bytes: &[u8]) -> std::io::Result<(usize, usize, Vec<u8>)> {
     Ok((info.width as usize, info.height as usize, luma))
 }
 
+fn write_canvas_png(
+    surface: &crate::surface::Surface,
+    path: &std::path::Path,
+    canvas_height: usize,
+) -> std::io::Result<()> {
+    let canvas_height = canvas_height.min(surface.h);
+    if surface.w == 0 || canvas_height == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "canvas has zero dimensions",
+        ));
+    }
+    let factor = surface.w.max(canvas_height).div_ceil(1024).max(1);
+    let width = surface.w.div_ceil(factor);
+    let height = canvas_height.div_ceil(factor);
+    let mut gray = vec![255u8; width * height];
+    for output_y in 0..height {
+        for output_x in 0..width {
+            let source_x0 = output_x * factor;
+            let source_y0 = output_y * factor;
+            let source_x1 = (source_x0 + factor).min(surface.w);
+            let source_y1 = (source_y0 + factor).min(canvas_height);
+            let mut sum = 0u32;
+            let mut count = 0u32;
+            for source_y in source_y0..source_y1 {
+                for source_x in source_x0..source_x1 {
+                    sum += u32::from(surface.luma(source_x as i32, source_y as i32));
+                    count += 1;
+                }
+            }
+            gray[output_y * width + output_x] = (sum / count.max(1)) as u8;
+        }
+    }
+
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+    encoder.set_color(png::ColorType::Grayscale);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    encoder
+        .write_header()
+        .map_err(std::io::Error::other)?
+        .write_image_data(&gray)
+        .map_err(std::io::Error::other)
+}
+
 #[cfg(all(feature = "kobo", target_os = "linux"))]
 pub fn run() -> std::io::Result<()> {
     use crate::fb::BBox;
@@ -481,14 +533,11 @@ pub fn run() -> std::io::Result<()> {
             Screen::Reply { .. } => {
                 draw_text(surf, font, "点一下回到画纸", 48.0, SCREEN_W / 2, y + 56)
             }
-            Screen::Refined => draw_text(
-                surf,
-                font,
-                "AI 润色完成 · 点一下回到原画",
-                42.0,
-                SCREEN_W / 2,
-                y + 60,
-            ),
+            Screen::Refined => {
+                surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
+                draw_text(surf, font, "回到原画", 48.0, SCREEN_W / 4, y + 56);
+                draw_text(surf, font, "在新图上继续画", 44.0, SCREEN_W * 3 / 4, y + 58);
+            }
             Screen::Error { message, .. } => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
                 let short: String = message.chars().take(34).collect();
@@ -617,6 +666,7 @@ pub fn run() -> std::io::Result<()> {
     let mut dirty = BBox::empty();
     let mut last_flush = Instant::now();
     let mut compose_snapshot: Option<Vec<u8>> = None;
+    let mut base_snapshot: Option<Vec<u8>> = None;
     let (net_tx, net_rx) = mpsc::channel();
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stopping))?;
@@ -631,10 +681,16 @@ pub fn run() -> std::io::Result<()> {
                         ink: &mut Ink,
                         surface: &mut Surface,
                         display: &crate::display::Display,
-                        snapshot: &mut Option<Vec<u8>>| {
+                        snapshot: &mut Option<Vec<u8>>,
+                        base: &mut Option<Vec<u8>>| {
         match action {
             Action::Upload => {
-                if let Err(error) = ink.to_png(surface, page_path.to_str().unwrap()) {
+                let export = if base.is_some() {
+                    write_canvas_png(surface, &page_path, SCREEN_H - ACTION_BAR_H as usize)
+                } else {
+                    ink.to_png(surface, page_path.to_str().unwrap())
+                };
+                if let Err(error) = export {
                     state.upload_finished(Err(error.to_string()));
                 } else {
                     start_upload(net_tx.clone(), page_path.clone());
@@ -650,7 +706,12 @@ pub fn run() -> std::io::Result<()> {
             }
             Action::Refine => {
                 *snapshot = Some(surface.copy_rect(0, 0, SCREEN_W, SCREEN_H));
-                if let Err(error) = ink.to_png(surface, page_path.to_str().unwrap()) {
+                let export = if base.is_some() {
+                    write_canvas_png(surface, &page_path, SCREEN_H - ACTION_BAR_H as usize)
+                } else {
+                    ink.to_png(surface, page_path.to_str().unwrap())
+                };
+                if let Err(error) = export {
                     state.refine_finished(Err(error.to_string()));
                 } else {
                     start_refine(net_tx.clone(), page_path.clone(), refined_path.clone());
@@ -678,6 +739,7 @@ pub fn run() -> std::io::Result<()> {
             Action::ClearCanvas => {
                 ink.clear();
                 snapshot.take();
+                base.take();
                 render_compose_shell(surface, &font);
                 render_controls(surface, &font, state);
                 display.full_refresh(SCREEN_W, SCREEN_H);
@@ -689,6 +751,15 @@ pub fn run() -> std::io::Result<()> {
                 } else {
                     render_compose_shell(surface, &font);
                 }
+                render_controls(surface, &font, state);
+                display.full_refresh(SCREEN_W, SCREEN_H);
+            }
+            Action::AdoptRefinement => {
+                ink.clear();
+                let canvas_height = SCREEN_H - ACTION_BAR_H as usize;
+                *base = Some(surface.copy_rect(0, 0, SCREEN_W, canvas_height));
+                snapshot.take();
+                state.has_ink = true;
                 render_controls(surface, &font, state);
                 display.full_refresh(SCREEN_W, SCREEN_H);
             }
@@ -718,6 +789,7 @@ pub fn run() -> std::io::Result<()> {
                         &mut surface,
                         &display,
                         &mut compose_snapshot,
+                        &mut base_snapshot,
                     );
                 }
                 NetResult::Refine(result) => {
@@ -782,7 +854,29 @@ pub fn run() -> std::io::Result<()> {
                             let radius = 2 + sample.pressure * 3 / MAX_PRESSURE;
                             ink.pen_point(&mut surface, sample.x, sample.y, radius)
                         }
-                        Tool::Eraser => ink.erase_point(&mut surface, sample.x, sample.y, 22),
+                        Tool::Eraser => {
+                            let changed = ink.erase_point(&mut surface, sample.x, sample.y, 22);
+                            if let Some(base) = &base_snapshot {
+                                let canvas_height = SCREEN_H - ACTION_BAR_H as usize;
+                                let x0 = changed.x0.max(0) as usize;
+                                let y0 = changed.y0.max(0) as usize;
+                                let x1 = (changed.x1.max(0) as usize + 1).min(SCREEN_W);
+                                let y1 = (changed.y1.max(0) as usize + 1).min(canvas_height);
+                                if x1 > x0 && y1 > y0 {
+                                    surface.paste_from_snapshot(
+                                        x0,
+                                        y0,
+                                        x1 - x0,
+                                        y1 - y0,
+                                        SCREEN_W,
+                                        canvas_height,
+                                        base,
+                                    );
+                                    ink.render_region(&mut surface, changed);
+                                }
+                            }
+                            changed
+                        }
                     };
                     if !changed.is_empty() {
                         dirty.add(changed.x0, changed.y0, 0);
@@ -798,7 +892,7 @@ pub fn run() -> std::io::Result<()> {
                 let screen_before = state.screen.clone();
                 let action = if matches!(state.screen, Screen::Compose) {
                     if press_target == ComposeTarget::Canvas {
-                        state.has_ink = !ink.is_empty();
+                        state.has_ink = base_snapshot.is_some() || !ink.is_empty();
                         Action::None
                     } else if press_target == release_target {
                         state.tap(sample.x, sample.y, now_ms)
@@ -816,6 +910,7 @@ pub fn run() -> std::io::Result<()> {
                         &mut surface,
                         &display,
                         &mut compose_snapshot,
+                        &mut base_snapshot,
                     );
                 }
                 press_target = ComposeTarget::Outside;
@@ -843,6 +938,7 @@ pub fn run() -> std::io::Result<()> {
                 &mut surface,
                 &display,
                 &mut compose_snapshot,
+                &mut base_snapshot,
             );
         }
         let _ = display.pump();
@@ -931,6 +1027,12 @@ mod tests {
         assert_eq!(state.screen, Screen::Refined);
         assert!(state.has_ink);
         assert_eq!(state.tap(200, 200, 1), Action::DismissRefinement);
+        assert_eq!(state.screen, Screen::Compose);
+        assert!(state.has_ink);
+
+        state.screen = Screen::Refined;
+        let (x, y) = confirm();
+        assert_eq!(state.tap(x, y, 1), Action::AdoptRefinement);
         assert_eq!(state.screen, Screen::Compose);
         assert!(state.has_ink);
 
@@ -1047,6 +1149,28 @@ mod tests {
         let error = decode_png_luma(&encoded).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("dimensions"));
+    }
+
+    #[test]
+    fn full_canvas_export_keeps_ai_background_and_overlay() {
+        use crate::surface::{PixFmt, Surface, BLACK, WHITE};
+        let mut bytes = vec![255u8; 12 * 10];
+        let mut surface = Surface::new(bytes.as_mut_ptr(), bytes.len(), 12, 10, 12, PixFmt::Gray8);
+        surface.fill_rect(0, 0, 12, 8, WHITE);
+        surface.fill_rect(2, 2, 4, 3, BLACK);
+        surface.fill_rect(9, 6, 2, 2, BLACK);
+        let path = std::env::temp_dir().join(format!(
+            "mailbox-canvas-export-{}-{}.png",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        write_canvas_png(&surface, &path, 8).unwrap();
+        let png = std::fs::read(&path).unwrap();
+        let (width, height, decoded) = decode_png_luma(&png).unwrap();
+        assert_eq!((width, height), (12, 8));
+        assert_eq!(decoded[2 * width + 2], 0);
+        assert_eq!(decoded[6 * width + 9], 0);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

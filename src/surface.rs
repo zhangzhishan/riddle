@@ -194,6 +194,36 @@ impl Surface {
         }
     }
 
+    /// Restore a sub-rectangle from a tightly packed full-surface snapshot.
+    /// The snapshot starts at (0, 0), uses this surface's pixel format, and
+    /// contains `snapshot_w * snapshot_h` pixels without stride padding.
+    pub fn paste_from_snapshot(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        snapshot_w: usize,
+        snapshot_h: usize,
+        data: &[u8],
+    ) {
+        let bpp = self.bpp();
+        let expected = snapshot_w.saturating_mul(snapshot_h).saturating_mul(bpp);
+        if data.len() < expected || x >= snapshot_w || y >= snapshot_h {
+            return;
+        }
+        let x1 = (x + w).min(self.w).min(snapshot_w);
+        let y1 = (y + h).min(self.h).min(snapshot_h);
+        let (stride, row_len) = (self.stride, (x1 - x) * bpp);
+        let destination = self.buf();
+        for row in y..y1 {
+            let source_start = (row * snapshot_w + x) * bpp;
+            let destination_start = row * stride + x * bpp;
+            destination[destination_start..destination_start + row_len]
+                .copy_from_slice(&data[source_start..source_start + row_len]);
+        }
+    }
+
     pub fn stamp(&mut self, cx: i32, cy: i32, r: i32, c: u16) {
         for dy in -r..=r {
             for dx in -r..=r {
@@ -262,6 +292,26 @@ mod tests {
         for y in 1..3 {
             for x in 1..4 {
                 assert_eq!(surface.luma(x, y), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn restores_subrect_from_full_snapshot() {
+        let (_buf, mut surface) = gray_surface(8, 6);
+        for y in 0..6 {
+            for x in 0..8 {
+                let value = if (x + y) % 2 == 0 { BLACK } else { WHITE };
+                surface.put_px(x, y, value);
+            }
+        }
+        let snapshot = surface.copy_rect(0, 0, 8, 6);
+        surface.fill_rect(2, 2, 3, 2, WHITE);
+        surface.paste_from_snapshot(2, 2, 3, 2, 8, 6, &snapshot);
+        for y in 2..4 {
+            for x in 2..5 {
+                let expected = if (x + y) % 2 == 0 { 0 } else { 255 };
+                assert_eq!(surface.luma(x, y), expected);
             }
         }
     }

@@ -14,7 +14,12 @@ pub struct Ink {
 
 impl Ink {
     pub fn new() -> Self {
-        Self { strokes: Vec::new(), current: Vec::new(), last_erase: None, bbox: BBox::empty() }
+        Self {
+            strokes: Vec::new(),
+            current: Vec::new(),
+            last_erase: None,
+            bbox: BBox::empty(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -104,6 +109,31 @@ impl Ink {
         self.last_erase = None;
     }
 
+    /// Repaint surviving black strokes that overlap a restored background area.
+    /// Used when erasing annotations drawn over an AI-generated base image.
+    pub fn render_region(&self, surf: &mut Surface, region: BBox) {
+        if region.is_empty() {
+            return;
+        }
+        for stroke in self.strokes.iter().chain(std::iter::once(&self.current)) {
+            if stroke.len() == 1 {
+                let (x, y, radius) = stroke[0];
+                if point_near_region(x, y, radius, region) {
+                    surf.stamp(x, y, radius, BLACK);
+                }
+                continue;
+            }
+            for segment in stroke.windows(2) {
+                let (x0, y0, r0) = segment[0];
+                let (x1, y1, r1) = segment[1];
+                let radius = r1.min(r0 + 1);
+                if segment_near_region(x0, y0, x1, y1, radius, region) {
+                    surf.brush_line(x0, y0, x1, y1, radius, BLACK);
+                }
+            }
+        }
+    }
+
     /// Rasterize the ink region to a grayscale PNG for the oracle.
     /// Crops to the ink bounding box and box-downscales so the long side stays
     /// ≤ 800px (at least 2x): the model reads handwriting fine at that scale,
@@ -126,7 +156,8 @@ impl Ink {
                 let mut acc = 0u32;
                 for sy in 0..f {
                     for sx in 0..f {
-                        acc += surf.luma((x0 + ox * f + sx) as i32, (y0 + oy * f + sy) as i32) as u32;
+                        acc +=
+                            surf.luma((x0 + ox * f + sx) as i32, (y0 + oy * f + sy) as i32) as u32;
                     }
                 }
                 gray[oy * w + ox] = (acc / (f * f) as u32) as u8;
@@ -145,6 +176,20 @@ impl Ink {
             .map_err(std::io::Error::other)?;
         Ok(())
     }
+}
+
+fn point_near_region(x: i32, y: i32, radius: i32, region: BBox) -> bool {
+    x + radius >= region.x0
+        && x - radius <= region.x1
+        && y + radius >= region.y0
+        && y - radius <= region.y1
+}
+
+fn segment_near_region(x0: i32, y0: i32, x1: i32, y1: i32, radius: i32, region: BBox) -> bool {
+    x0.min(x1) - radius <= region.x1
+        && x0.max(x1) + radius >= region.x0
+        && y0.min(y1) - radius <= region.y1
+        && y0.max(y1) + radius >= region.y0
 }
 
 /// Deterministic per-pixel hash for the dissolve pattern.
@@ -198,8 +243,15 @@ mod tests {
         // Erase through the middle: the stroke splits, points vanish.
         ink.erase_point(&mut s, 110, 100, 20);
         let after: usize = ink.stroke_list().iter().map(|s| s.len()).sum();
-        assert!(after < before, "erase kept every point ({after} of {before})");
-        assert_eq!(ink.stroke_list().len(), 2, "middle-erase should split the stroke");
+        assert!(
+            after < before,
+            "erase kept every point ({after} of {before})"
+        );
+        assert_eq!(
+            ink.stroke_list().len(),
+            2,
+            "middle-erase should split the stroke"
+        );
         // No surviving point lies under the eraser.
         for st in ink.stroke_list() {
             for &(x, y, _) in st {
@@ -219,5 +271,21 @@ mod tests {
         ink.erase_point(&mut s, 102, 100, 30);
         assert!(ink.stroke_list().is_empty());
         assert!(ink.bbox.is_empty());
+    }
+
+    #[test]
+    fn render_region_repaints_surviving_annotation_segments() {
+        let (_buf, mut s) = surf();
+        let mut ink = Ink::new();
+        for x in (40..=160).step_by(10) {
+            ink.pen_point(&mut s, x, 100, 3);
+        }
+        ink.pen_up();
+        let mut region = BBox::empty();
+        region.add(90, 100, 20);
+        s.fill_rect(70, 80, 40, 40, WHITE);
+        ink.render_region(&mut s, region);
+        assert_eq!(s.luma(90, 100), 0);
+        assert_eq!(s.luma(20, 20), 255);
     }
 }
