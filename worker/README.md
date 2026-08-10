@@ -5,12 +5,14 @@ This directory contains the production HTTPS implementation of Ian's Paper Plane
 ## Architecture
 
 - Cloudflare Worker: strict HTTP routing, capability authentication, family HTML UI, PNG validation.
-- D1 (`MAILBOX_DB`): message/reply metadata and ordered integer IDs.
-- Workers KV (`MAILBOX_IMAGES`): original PNG bytes (up to 4 MiB each).
+- D1 (`MAILBOX_DB`): message/reply metadata, AI refinement history, and ordered integer IDs.
+- Workers KV (`MAILBOX_IMAGES`): mailbox PNGs plus each AI input/output pair.
 - Custom domain: `https://ian-mailbox.code4fun.me`.
 - Secrets: `MAILBOX_DEVICE_TOKEN`, `MAILBOX_FAMILY_TOKEN`, `AZURE_MAI_API_KEY`, `AZURE_MAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and `AZURE_OPENAI_ENDPOINT`, stored with Wrangler and never committed. `AZURE_MAI_MODEL` is optional: a comma-separated tier list that overrides the default `MAI-Image-2.5-Pro,MAI-Image-2.5,MAI-Image-2.5-Flash`. `AZURE_OPENAI_IMAGE_DEPLOYMENT` optionally overrides the final fallback deployment, which defaults to `gpt-image-2`.
 
-The Kobo can deliberately request **AI 润色** after drawing. The Worker keeps the Azure credential off the device, calls the Microsoft Foundry image-edit endpoint, and returns a PNG that the Kobo scales to its grayscale canvas. The original drawing stays intact and reappears when the result is dismissed. A deterministic `X-Refinement-Key` caches successful results in KV, so retrying the same drawing normally does not create another paid image request.
+The Kobo can deliberately request **AI 润色** after drawing. If the input is mainly handwriting, including Chinese, the fixed prompt tells the model to treat those words as the scene request and generate the described picture instead of simply reproducing the text. The Worker keeps Azure credentials off the device and returns a PNG that the Kobo scales to its grayscale canvas. After generation, Ian can either return to the original or adopt the AI result as a new background and continue drawing on top; later send/refine actions export the full composited canvas. A deterministic `X-Refinement-Key` caches successful results in KV, so retrying the same drawing normally does not create another paid image request.
+
+Every successful AI request stores its submitted PNG and generated PNG as a pair. Family members who already hold the private family cookie can open `/refinements` to browse the newest pairs first; both image routes remain capability-protected and non-cacheable.
 
 MAI preview quota may be unavailable or heavily constrained, so refinement
 walks a quality-ordered tier list and steps down on network failures,

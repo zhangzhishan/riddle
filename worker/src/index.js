@@ -9,7 +9,10 @@ const MAI_IMAGES_EDIT_PATH = "/mai/v1/images/edits";
 const MAI_DEFAULT_MODELS = ["MAI-Image-2.5-Pro", "MAI-Image-2.5", "MAI-Image-2.5-Flash"];
 const AZURE_OPENAI_IMAGES_EDIT_PATH = "/openai/v1/images/edits";
 const AZURE_OPENAI_DEFAULT_IMAGE_MODEL = "gpt-image-2";
-const REFINE_PROMPT = `Refine this child's drawing into a polished, colorful children's-book illustration. Preserve the original subject, composition, poses, proportions, line placement, and charming imperfections so it is clearly the same drawing. Clean up the linework, add coherent colors, gentle shading, and a simple supportive background without redesigning it. Do not add text, logos, watermarks, frightening imagery, weapons, or new characters unless they are clearly present in the drawing. Keep it warm, playful, age-appropriate, and use strong value contrast so it remains readable in grayscale.`;
+const REFINE_PROMPT = `Use the input in one of two ways:
+1. If it is mainly a child's drawing, refine it into a polished, colorful children's-book illustration while preserving the original subject, composition, poses, proportions, line placement, and charming imperfections so it is clearly the same drawing.
+2. If it is mainly handwritten words or a written scene request, including Chinese handwriting, read the words as the image prompt and generate the picture they describe. Do not merely typeset or reproduce the handwritten words unless the request explicitly asks for visible text.
+In either case, use clean linework, coherent colors, gentle shading, and a simple supportive background. Do not add logos, watermarks, frightening imagery, weapons, or unrelated characters. Keep it warm, playful, age-appropriate, and use strong value contrast so it remains readable in grayscale.`;
 
 const STYLE = `:root {
   color-scheme: light;
@@ -36,6 +39,16 @@ h1 {
   letter-spacing: -0.04em;
 }
 .intro { margin: 0.6rem 0 1.8rem; color: #5e5a52; }
+nav { display: flex; gap: 0.65rem; margin: 0.9rem 0 1.6rem; }
+nav a {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 0.65rem 1rem;
+  background: #1d6d74;
+  color: white;
+  font-weight: 750;
+  text-decoration: none;
+}
 .message-card {
   overflow: hidden;
   margin: 0 0 1.4rem;
@@ -88,10 +101,16 @@ button {
 button:focus-visible, textarea:focus-visible { outline: 3px solid #edac4d; outline-offset: 2px; }
 .reply { background: #fff3cf; }
 .reply p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.refinement-pair { display: grid; grid-template-columns: 1fr; }
+.refinement-pair figure { margin: 0; min-width: 0; }
+.refinement-pair figcaption { padding: 0.65rem 1rem; font-weight: 750; background: #f7f2e8; }
+.refinement-pair img { border-block: 1px solid #e5dfd4; }
+.model { padding: 0.8rem 1rem; color: #666057; font-size: 0.86rem; }
 .empty { padding: 2rem; border-radius: 1rem; background: #fffdf8; text-align: center; }
 @media (min-width: 40rem) {
   main { padding-top: 3.5rem; }
   form, .reply { padding: 1.25rem; }
+  .refinement-pair { grid-template-columns: 1fr 1fr; }
 }`;
 
 const CRC_TABLE = (() => {
@@ -308,6 +327,30 @@ function decodeBase64Image(value) {
   return bytes;
 }
 
+async function recordRefinementHistory(env, {
+  deviceId,
+  refinementKey,
+  inputKey,
+  outputKey,
+  model,
+  input,
+  output,
+}) {
+  await Promise.all([
+    env.MAILBOX_IMAGES.put(inputKey, input, {
+      metadata: { contentType: "image/png", role: "input" },
+    }),
+    env.MAILBOX_IMAGES.put(outputKey, output, {
+      metadata: { contentType: "image/png", role: "output", model },
+    }),
+  ]);
+  await env.MAILBOX_DB.prepare(
+    `INSERT OR IGNORE INTO refinements
+       (device_id, refinement_key, input_key, output_key, model, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).bind(deviceId, refinementKey, inputKey, outputKey, model, utcTimestamp()).run();
+}
+
 async function handleUpload(request, env) {
   if (!(await deviceAuthorized(request, env))) {
     throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
@@ -419,12 +462,34 @@ async function handleRefinement(request, env) {
     throw new HttpError(400, error.message);
   }
 
-  const cacheKey = `refinements/${encodeURIComponent(deviceId)}/${refinementKey}.png`;
-  const cached = await env.MAILBOX_IMAGES.get(cacheKey, "arrayBuffer");
+  const encodedDeviceId = encodeURIComponent(deviceId);
+  const inputKey = `refinement-inputs/${encodedDeviceId}/${refinementKey}.png`;
+  const cacheKey = `refinements/${encodedDeviceId}/${refinementKey}.png`;
+  let cached = null;
+  let cachedModel = "cached-result";
+  if (typeof env.MAILBOX_IMAGES.getWithMetadata === "function") {
+    const entry = await env.MAILBOX_IMAGES.getWithMetadata(cacheKey, "arrayBuffer");
+    cached = entry?.value || null;
+    cachedModel = entry?.metadata?.model || cachedModel;
+  } else {
+    cached = await env.MAILBOX_IMAGES.get(cacheKey, "arrayBuffer");
+  }
   if (cached) {
+    await recordRefinementHistory(env, {
+      deviceId,
+      refinementKey,
+      inputKey,
+      outputKey: cacheKey,
+      model: cachedModel,
+      input: payload,
+      output: cached,
+    });
     return new Response(cached, {
       status: 200,
-      headers: responseHeaders("image/png", { "X-Refinement-Cache": "hit" }),
+      headers: responseHeaders("image/png", {
+        "X-Refinement-Cache": "hit",
+        "X-Refinement-Model": cachedModel,
+      }),
     });
   }
 
@@ -511,8 +576,14 @@ async function handleRefinement(request, env) {
   }
 
   if (refined === null) throw new HttpError(502, "image refinement failed");
-  await env.MAILBOX_IMAGES.put(cacheKey, refined, {
-    metadata: { contentType: "image/png", model },
+  await recordRefinementHistory(env, {
+    deviceId,
+    refinementKey,
+    inputKey,
+    outputKey: cacheKey,
+    model,
+    input: payload,
+    output: refined,
   });
   return new Response(refined, {
     status: 200,
@@ -622,6 +693,69 @@ async function handleReply(request, env, messageId) {
   return empty(303, { Location: `/#message-${messageId}` });
 }
 
+async function handleRefinementHistory(request, env) {
+  if (!(await familyAuthorized(request, env))) throw new HttpError(403, "forbidden");
+  const query = await env.MAILBOX_DB.prepare(
+    `SELECT id, device_id, model, created_at
+     FROM refinements
+     ORDER BY id DESC`,
+  ).all();
+  return new Response(renderRefinementHistory(query.results || []), {
+    status: 200,
+    headers: responseHeaders("text/html; charset=utf-8", {
+      "Content-Security-Policy": "default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+    }),
+  });
+}
+
+async function handleRefinementImage(request, env, refinementId, side) {
+  if (!(await familyAuthorized(request, env))) throw new HttpError(403, "forbidden");
+  const row = await env.MAILBOX_DB.prepare(
+    "SELECT input_key, output_key FROM refinements WHERE id = ?",
+  ).bind(refinementId).first();
+  if (!row) throw new HttpError(404, "not found");
+  const key = side === "input" ? row.input_key : row.output_key;
+  const image = await env.MAILBOX_IMAGES.get(key, "arrayBuffer");
+  if (!image) throw new HttpError(404, "not found");
+  return new Response(image, { status: 200, headers: responseHeaders("image/png") });
+}
+
+export function renderRefinementHistory(refinements) {
+  const cards = refinements.map((item) => {
+    const id = Number(item.id);
+    const device = escapeHtml(item.device_id);
+    const model = escapeHtml(item.model);
+    const created = escapeHtml(item.created_at);
+    return `<article class="message-card" id="refinement-${id}">
+      <header><span>来自 ${device}</span><time datetime="${created}">${created}</time></header>
+      <div class="refinement-pair">
+        <figure><figcaption>发给 AI 的原图</figcaption><img src="/refinements/${id}/input.png" alt="第 ${id} 次 AI 创作的输入图" loading="lazy"></figure>
+        <figure><figcaption>AI 生成的图片</figcaption><img src="/refinements/${id}/output.png" alt="第 ${id} 次 AI 创作的结果图" loading="lazy"></figure>
+      </div>
+      <div class="model">模型：${model}</div>
+    </article>`;
+  });
+  if (cards.length === 0) cards.push('<p class="empty">还没有 AI 创作记录。</p>');
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>Ian 的 AI 创作历史</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main>
+    <h1>AI 创作历史</h1>
+    <nav><a href="/">纸飞机</a><a href="/refinements">AI 创作历史</a></nav>
+    <p class="intro">每次发给 AI 的原图和生成结果都会成对保存在这里。</p>
+    ${cards.join("\n")}
+  </main>
+</body>
+</html>`;
+}
+
 export function renderIndex(messages) {
   const cards = messages.map((message) => {
     const id = Number(message.id);
@@ -653,6 +787,7 @@ export function renderIndex(messages) {
 <body>
   <main>
     <h1>Ian 的纸飞机信箱</h1>
+    <nav><a href="/">纸飞机</a><a href="/refinements">AI 创作历史</a></nav>
     <p class="intro">Ian 的画，最新一张在最前面。</p>
     ${cards.join("\n")}
   </main>
@@ -685,10 +820,17 @@ async function handleRequest(request, env) {
   if (request.method === "GET" && url.pathname === "/") {
     return handleFamilyIndex(request, env, url);
   }
+  if (request.method === "GET" && url.pathname === "/refinements" && url.search === "") {
+    return handleRefinementHistory(request, env);
+  }
   if (request.method === "GET" && url.pathname === "/static/style.css" && url.search === "") {
     return handleCss(request, env);
   }
-  let match = url.pathname.match(/^\/messages\/([1-9][0-9]*)\.png$/);
+  let match = url.pathname.match(/^\/refinements\/([1-9][0-9]*)\/(input|output)\.png$/);
+  if (request.method === "GET" && match && url.search === "") {
+    return handleRefinementImage(request, env, Number(match[1]), match[2]);
+  }
+  match = url.pathname.match(/^\/messages\/([1-9][0-9]*)\.png$/);
   if (request.method === "GET" && match && url.search === "") {
     return handleImage(request, env, Number(match[1]));
   }

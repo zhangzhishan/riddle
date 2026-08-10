@@ -6,6 +6,7 @@ import worker, {
   parseContentLength,
   refinementModels,
   renderIndex,
+  renderRefinementHistory,
   safeEqual,
   validatePng,
 } from "../src/index.js";
@@ -57,15 +58,65 @@ function makePng(extra = []) {
   return concat(signature, chunk("IHDR", ihdr), ...extra, chunk("IDAT", Uint8Array.of(1)), chunk("IEND"));
 }
 
+function memoryRefinementDb() {
+  const rows = [];
+  return {
+    rows,
+    prepare(sql) {
+      let bindings = [];
+      return {
+        bind(...values) {
+          bindings = values;
+          return this;
+        },
+        async run() {
+          if (!sql.includes("INSERT OR IGNORE INTO refinements")) {
+            throw new Error(`unexpected run SQL: ${sql}`);
+          }
+          const [device_id, refinement_key, input_key, output_key, model, created_at] = bindings;
+          const existing = rows.find((row) => (
+            row.device_id === device_id && row.refinement_key === refinement_key
+          ));
+          if (!existing) {
+            rows.push({
+              id: rows.length + 1,
+              device_id,
+              refinement_key,
+              input_key,
+              output_key,
+              model,
+              created_at,
+            });
+          }
+          return { success: true };
+        },
+        async all() {
+          if (!sql.includes("FROM refinements")) throw new Error(`unexpected all SQL: ${sql}`);
+          return { results: [...rows].reverse() };
+        },
+        async first() {
+          if (!sql.includes("FROM refinements WHERE id = ?")) {
+            throw new Error(`unexpected first SQL: ${sql}`);
+          }
+          return rows.find((row) => row.id === Number(bindings[0])) || null;
+        },
+      };
+    },
+  };
+}
+
 const env = {
   MAILBOX_DEVICE_TOKEN: "device-secret",
   MAILBOX_FAMILY_TOKEN: "family-secret",
+  MAILBOX_DB: memoryRefinementDb(),
 };
 
 function memoryKv() {
   const values = new Map();
+  const metadata = new Map();
   return {
     values,
+    metadata,
     async get(key, type) {
       const value = values.get(key);
       if (value == null) return null;
@@ -74,11 +125,19 @@ function memoryKv() {
       }
       return value;
     },
-    async put(key, value) {
+    async getWithMetadata(key, type) {
+      return {
+        value: await this.get(key, type),
+        metadata: metadata.get(key) || null,
+      };
+    },
+    async put(key, value, options = {}) {
       values.set(key, new Uint8Array(value));
+      metadata.set(key, options.metadata || null);
     },
     async delete(key) {
       values.delete(key);
+      metadata.delete(key);
     },
   };
 }
@@ -135,9 +194,26 @@ test("family HTML is latest-ready, responsive, and escapes stored content", () =
   assert.match(html, /Ian 的纸飞机信箱/);
   assert.match(html, /viewport/);
   assert.match(html, /noindex,nofollow,noarchive/);
+  assert.match(html, /AI 创作历史/);
   assert.match(html, /ian-kobo&lt;script&gt;/);
   assert.match(html, /你好 &lt;b&gt;Ian&lt;\/b&gt;/);
   assert.doesNotMatch(html, /<b>Ian<\/b>/);
+});
+
+test("refinement history renders protected before-and-after pairs safely", () => {
+  const html = renderRefinementHistory([{
+    id: 7,
+    device_id: "ian<script>",
+    model: "MAI<Pro>",
+    created_at: "2026-07-27T12:00:00Z",
+  }]);
+  assert.match(html, /发给 AI 的原图/);
+  assert.match(html, /AI 生成的图片/);
+  assert.match(html, /\/refinements\/7\/input\.png/);
+  assert.match(html, /\/refinements\/7\/output\.png/);
+  assert.match(html, /ian&lt;script&gt;/);
+  assert.match(html, /MAI&lt;Pro&gt;/);
+  assert.doesNotMatch(html, /ian<script>/);
 });
 
 test("public health and generic method handling return hardened responses", async () => {
@@ -165,6 +241,52 @@ test("protected routes reject invalid credentials before storage access", async 
   }), env);
   assert.equal(upload.status, 401);
   assert.equal(upload.headers.get("WWW-Authenticate"), 'Bearer realm="paper-plane-device"');
+
+  const history = await worker.fetch(new Request("https://example.test/refinements"), env);
+  assert.equal(history.status, 403);
+  const image = await worker.fetch(new Request("https://example.test/refinements/1/input.png"), env);
+  assert.equal(image.status, 403);
+});
+
+test("family can browse protected refinement history and both images", async () => {
+  const database = memoryRefinementDb();
+  const images = memoryKv();
+  const input = makePng([chunk("tEXt", new TextEncoder().encode("input"))]);
+  const output = makePng([chunk("tEXt", new TextEncoder().encode("output"))]);
+  database.rows.push({
+    id: 1,
+    device_id: "ian-kobo",
+    refinement_key: "0123456789abcdef",
+    input_key: "history/input.png",
+    output_key: "history/output.png",
+    model: "MAI-Image-2.5-Pro",
+    created_at: "2026-07-27T12:00:00Z",
+  });
+  await images.put("history/input.png", input);
+  await images.put("history/output.png", output);
+  const historyEnv = { ...env, MAILBOX_DB: database, MAILBOX_IMAGES: images };
+  const bootstrap = await worker.fetch(
+    new Request("https://example.test/?token=family-secret"),
+    historyEnv,
+  );
+  assert.equal(bootstrap.status, 303);
+  const cookie = bootstrap.headers.get("Set-Cookie").split(";", 1)[0];
+
+  const page = await worker.fetch(new Request("https://example.test/refinements", {
+    headers: { Cookie: cookie },
+  }), historyEnv);
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /MAI-Image-2\.5-Pro/);
+
+  for (const [side, expected] of [["input", input], ["output", output]]) {
+    const response = await worker.fetch(new Request(
+      `https://example.test/refinements/1/${side}.png`,
+      { headers: { Cookie: cookie } },
+    ), historyEnv);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Type"), "image/png");
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), expected);
+  }
 });
 
 test("device can refine a PNG through MAI-Image-2.5-Pro and retries use the KV cache", async () => {
@@ -190,6 +312,9 @@ test("device can refine a PNG through MAI-Image-2.5-Pro and retries use the KV c
     assert.equal(options.body.get("size"), "1024x1536");
     assert.equal(options.body.get("output_format"), "png");
     assert.match(options.body.get("prompt"), /child.*drawing/i);
+    assert.match(options.body.get("prompt"), /handwritten words/i);
+    assert.match(options.body.get("prompt"), /Chinese handwriting/i);
+    assert.match(options.body.get("prompt"), /generate the picture/i);
     const image = options.body.get("image");
     assert.equal(image.type, "image/png");
     assert.deepEqual(new Uint8Array(await image.arrayBuffer()), input);
@@ -220,9 +345,14 @@ test("device can refine a PNG through MAI-Image-2.5-Pro and retries use the KV c
     const second = await worker.fetch(request(), refineEnv);
     assert.equal(second.status, 200);
     assert.equal(second.headers.get("X-Refinement-Cache"), "hit");
+    assert.equal(second.headers.get("X-Refinement-Model"), "MAI-Image-2.5-Pro");
     assert.deepEqual(new Uint8Array(await second.arrayBuffer()), refined);
     assert.equal(openAiCalls, 1);
+    assert.deepEqual(images.values.get("refinement-inputs/ian-kobo/0123456789abcdef.png"), input);
     assert.deepEqual(images.values.get("refinements/ian-kobo/0123456789abcdef.png"), refined);
+    const history = refineEnv.MAILBOX_DB.rows.find((row) => row.refinement_key === "0123456789abcdef");
+    assert.equal(history.device_id, "ian-kobo");
+    assert.equal(history.model, "MAI-Image-2.5-Pro");
   } finally {
     globalThis.fetch = originalFetch;
   }
