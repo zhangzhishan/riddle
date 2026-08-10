@@ -7,6 +7,8 @@ const COOKIE_CONTEXT = "paper-plane-family-cookie-v1";
 const PNG_SIGNATURE = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 const MAI_IMAGES_EDIT_PATH = "/mai/v1/images/edits";
 const MAI_DEFAULT_MODELS = ["MAI-Image-2.5-Pro", "MAI-Image-2.5", "MAI-Image-2.5-Flash"];
+const AZURE_OPENAI_IMAGES_EDIT_PATH = "/openai/v1/images/edits";
+const AZURE_OPENAI_DEFAULT_IMAGE_MODEL = "gpt-image-2";
 const REFINE_PROMPT = `Refine this child's drawing into a polished, colorful children's-book illustration. Preserve the original subject, composition, poses, proportions, line placement, and charming imperfections so it is clearly the same drawing. Clean up the linework, add coherent colors, gentle shading, and a simple supportive background without redesigning it. Do not add text, logos, watermarks, frightening imagery, weapons, or new characters unless they are clearly present in the drawing. Keep it warm, playful, age-appropriate, and use strong value contrast so it remains readable in grayscale.`;
 
 const STYLE = `:root {
@@ -348,11 +350,53 @@ export function refinementModels(env) {
   return configured.length > 0 ? configured : MAI_DEFAULT_MODELS;
 }
 
+function refinementForm(payload, model, imageField) {
+  const form = new FormData();
+  form.append("model", model);
+  form.append(imageField, new Blob([payload], { type: "image/png" }), "drawing.png");
+  form.append("prompt", REFINE_PROMPT);
+  form.append("input_fidelity", "high");
+  form.append("quality", "low");
+  form.append("size", "1024x1536");
+  form.append("output_format", "png");
+  form.append("moderation", "auto");
+  form.append("n", "1");
+  return form;
+}
+
+async function classifyUpstreamFailure(response) {
+  let body = null;
+  try {
+    body = await response.clone().json();
+  } catch {
+    // Some upstream failures have an empty or non-JSON body.
+  }
+
+  const error = body?.error;
+  const signals = [
+    response.headers.get("x-ms-error-code"),
+    error?.code,
+    error?.innererror?.code,
+    body?.code,
+    error?.message,
+  ].filter((value) => typeof value === "string" && value.length > 0);
+  const moderation = signals.some((value) => (
+    /content.?policy|content.?filter|moderation|responsible.?ai|safety.?system/i.test(value)
+  ));
+  const code = signals
+    .find((value) => !/\s/.test(value))
+    ?.replace(/[\r\n]/g, " ")
+    .slice(0, 100) || "no-error-code";
+  return { code, moderation };
+}
+
 async function handleRefinement(request, env) {
   if (!(await deviceAuthorized(request, env))) {
     throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
   }
-  if (!env.AZURE_MAI_API_KEY || !env.AZURE_MAI_ENDPOINT) {
+  const maiConfigured = Boolean(env.AZURE_MAI_API_KEY && env.AZURE_MAI_ENDPOINT);
+  const azureOpenAiConfigured = Boolean(env.AZURE_OPENAI_API_KEY && env.AZURE_OPENAI_ENDPOINT);
+  if (!maiConfigured && !azureOpenAiConfigured) {
     throw new HttpError(503, "image refinement is not configured");
   }
   if ((request.headers.get("Content-Type") || "").toLowerCase() !== "image/png") {
@@ -384,34 +428,68 @@ async function handleRefinement(request, env) {
     });
   }
 
-  const models = refinementModels(env);
-  const endpoint = `${env.AZURE_MAI_ENDPOINT.replace(/\/+$/, "")}${MAI_IMAGES_EDIT_PATH}`;
-
-  let result = null;
+  let refined = null;
   let model = null;
-  for (let index = 0; index < models.length; index += 1) {
-    const candidate = models[index];
-    const form = new FormData();
-    form.append("model", candidate);
-    form.append("image", new Blob([payload], { type: "image/png" }), "drawing.png");
-    form.append("prompt", REFINE_PROMPT);
-    form.append("input_fidelity", "high");
-    form.append("quality", "low");
-    form.append("size", "1024x1536");
-    form.append("output_format", "png");
-    form.append("moderation", "auto");
-    form.append("n", "1");
+  if (maiConfigured) {
+    const models = refinementModels(env);
+    const endpoint = `${env.AZURE_MAI_ENDPOINT.replace(/\/+$/, "")}${MAI_IMAGES_EDIT_PATH}`;
+    for (let index = 0; index < models.length; index += 1) {
+      const candidate = models[index];
+      let upstream;
+      try {
+        upstream = await fetch(endpoint, {
+          method: "POST",
+          headers: { "api-key": env.AZURE_MAI_API_KEY },
+          body: refinementForm(payload, candidate, "image"),
+        });
+      } catch (error) {
+        console.error("image refinement request failed", candidate, error?.message || String(error));
+        if (index + 1 < models.length) continue;
+        break;
+      }
+      if (!upstream.ok) {
+        const failure = await classifyUpstreamFailure(upstream);
+        console.error(
+          "image refinement upstream error",
+          candidate,
+          upstream.status,
+          failure.code,
+          upstream.headers.get("x-request-id") || "no-request-id",
+        );
+        if (failure.moderation) throw new HttpError(502, "image refinement failed");
 
+        // Capacity/transient failures try the remaining MAI tiers. Other MAI
+        // client errors skip directly to the separately configured provider.
+        const retryable = upstream.status === 429 || upstream.status >= 500;
+        if (retryable && index + 1 < models.length) continue;
+        break;
+      }
+
+      try {
+        const result = await upstream.json();
+        refined = decodeBase64Image(result?.data?.[0]?.b64_json);
+        model = candidate;
+        break;
+      } catch {
+        console.error("image refinement returned an invalid response", candidate);
+        if (index + 1 < models.length) continue;
+        break;
+      }
+    }
+  }
+
+  if (refined === null && azureOpenAiConfigured) {
+    const candidate = env.AZURE_OPENAI_IMAGE_DEPLOYMENT || AZURE_OPENAI_DEFAULT_IMAGE_MODEL;
+    const endpoint = `${env.AZURE_OPENAI_ENDPOINT.replace(/\/+$/, "")}${AZURE_OPENAI_IMAGES_EDIT_PATH}`;
     let upstream;
     try {
       upstream = await fetch(endpoint, {
         method: "POST",
-        headers: { "api-key": env.AZURE_MAI_API_KEY },
-        body: form,
+        headers: { "api-key": env.AZURE_OPENAI_API_KEY },
+        body: refinementForm(payload, candidate, "image[]"),
       });
     } catch (error) {
       console.error("image refinement request failed", candidate, error?.message || String(error));
-      if (index + 1 < models.length) continue;
       throw new HttpError(502, "image refinement failed");
     }
     if (!upstream.ok) {
@@ -421,24 +499,18 @@ async function handleRefinement(request, env) {
         upstream.status,
         upstream.headers.get("x-request-id") || "no-request-id",
       );
-      // Only capacity/transient failures are worth trying the next tier for.
-      const retryable = upstream.status === 429 || upstream.status >= 500;
-      if (retryable && index + 1 < models.length) continue;
       throw new HttpError(502, "image refinement failed");
     }
-
     try {
-      result = await upstream.json();
+      const result = await upstream.json();
+      refined = decodeBase64Image(result?.data?.[0]?.b64_json);
+      model = candidate;
     } catch {
-      if (index + 1 < models.length) continue;
-      throw new HttpError(502, "image refinement returned invalid JSON");
+      throw new HttpError(502, "image refinement returned an invalid response");
     }
-    model = candidate;
-    break;
   }
-  if (result === null) throw new HttpError(502, "image refinement failed");
 
-  const refined = decodeBase64Image(result?.data?.[0]?.b64_json);
+  if (refined === null) throw new HttpError(502, "image refinement failed");
   await env.MAILBOX_IMAGES.put(cacheKey, refined, {
     metadata: { contentType: "image/png", model },
   });

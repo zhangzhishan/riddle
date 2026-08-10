@@ -8,19 +8,25 @@ This directory contains the production HTTPS implementation of Ian's Paper Plane
 - D1 (`MAILBOX_DB`): message/reply metadata and ordered integer IDs.
 - Workers KV (`MAILBOX_IMAGES`): original PNG bytes (up to 4 MiB each).
 - Custom domain: `https://ian-mailbox.code4fun.me`.
-- Secrets: `MAILBOX_DEVICE_TOKEN`, `MAILBOX_FAMILY_TOKEN`, `AZURE_MAI_API_KEY`, and `AZURE_MAI_ENDPOINT`, stored with Wrangler and never committed. `AZURE_MAI_MODEL` is optional: a comma-separated tier list that overrides the default `MAI-Image-2.5-Pro,MAI-Image-2.5,MAI-Image-2.5-Flash`.
+- Secrets: `MAILBOX_DEVICE_TOKEN`, `MAILBOX_FAMILY_TOKEN`, `AZURE_MAI_API_KEY`, `AZURE_MAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and `AZURE_OPENAI_ENDPOINT`, stored with Wrangler and never committed. `AZURE_MAI_MODEL` is optional: a comma-separated tier list that overrides the default `MAI-Image-2.5-Pro,MAI-Image-2.5,MAI-Image-2.5-Flash`. `AZURE_OPENAI_IMAGE_DEPLOYMENT` optionally overrides the final fallback deployment, which defaults to `gpt-image-2`.
 
 The Kobo can deliberately request **AI 润色** after drawing. The Worker keeps the Azure credential off the device, calls the Microsoft Foundry image-edit endpoint, and returns a PNG that the Kobo scales to its grayscale canvas. The original drawing stays intact and reappears when the result is dismissed. A deterministic `X-Refinement-Key` caches successful results in KV, so retrying the same drawing normally does not create another paid image request.
 
-Each MAI deployment only carries 2 RPM of preview quota, so refinement walks a
-quality-ordered tier list and steps down on `429`/`5xx`:
-`MAI-Image-2.5-Pro` → `MAI-Image-2.5` → `MAI-Image-2.5-Flash` (6 RPM combined).
-Non-retryable upstream failures such as `400` moderation rejections stop
-immediately instead of burning the cheaper tiers. The tier that produced the
-image is reported in the `X-Refinement-Model` response header and stored in the
-KV entry metadata.
+MAI preview quota may be unavailable or heavily constrained, so refinement
+walks a quality-ordered tier list and steps down on network failures,
+`429`, or `5xx`:
+`MAI-Image-2.5-Pro` → `MAI-Image-2.5` → `MAI-Image-2.5-Flash` → Azure OpenAI `gpt-image-2`.
+Explicit content-moderation rejections stop immediately instead of trying
+another provider. Other MAI client errors skip the remaining MAI tiers and go
+directly to the separately configured Azure OpenAI fallback. The model that
+produced the image is reported in the `X-Refinement-Model` response header and
+stored in KV entry metadata.
 
-The upstream path is `${AZURE_MAI_ENDPOINT}/mai/v1/images/edits` with an `api-key` header and the image in a form field named `image` (not `image[]`). MAI models are **not** reachable through the `/openai/...` routes — those return intermittent 404/429.
+The MAI path is `${AZURE_MAI_ENDPOINT}/mai/v1/images/edits` with an `api-key`
+header and an `image` form field. The Azure OpenAI fallback uses
+`${AZURE_OPENAI_ENDPOINT}/openai/v1/images/edits`, the separate Azure OpenAI
+key, and an `image[]` form field. MAI models are **not** reachable through the
+`/openai/...` routes.
 
 The Python service under `server/` remains useful for local/LAN deployment and the original mailbox protocol tests. Upload, reply, family, and health routes stay compatible between both implementations; AI refinement is provided by the production Worker because that is where the Azure secret and result cache live.
 
@@ -58,6 +64,8 @@ npx wrangler secret put MAILBOX_DEVICE_TOKEN
 npx wrangler secret put MAILBOX_FAMILY_TOKEN
 npx wrangler secret put AZURE_MAI_API_KEY
 npx wrangler secret put AZURE_MAI_ENDPOINT   # e.g. https://<account>.services.ai.azure.com
+npx wrangler secret put AZURE_OPENAI_API_KEY
+npx wrangler secret put AZURE_OPENAI_ENDPOINT
 curl -fsS https://ian-mailbox.code4fun.me/healthz
 ```
 

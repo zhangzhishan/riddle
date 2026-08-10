@@ -310,20 +310,129 @@ test("refinement falls back down the model tiers when capacity is exhausted", as
   }
 });
 
-test("a 400 from the first tier does not waste the fallback tiers", async () => {
+test("refinement falls back to Azure gpt-image-2 after every MAI tier is exhausted", async () => {
+  const input = makePng();
+  const refined = makePng([chunk("tEXt", new TextEncoder().encode("gpt-image-2"))]);
+  const images = memoryKv();
+  const refineEnv = {
+    ...env,
+    AZURE_MAI_API_KEY: "azure-mai-test-secret",
+    AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com",
+    AZURE_OPENAI_API_KEY: "azure-openai-test-secret",
+    AZURE_OPENAI_ENDPOINT: "https://openai-test.openai.azure.com/",
+    MAILBOX_IMAGES: images,
+  };
+  const attempted = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    const model = options.body.get("model");
+    attempted.push(model);
+    if (url === "https://mai-test.services.ai.azure.com/mai/v1/images/edits") {
+      assert.equal(options.headers["api-key"], "azure-mai-test-secret");
+      assert.equal(options.body.get("image").type, "image/png");
+      assert.equal(options.body.get("image[]"), null);
+      return new Response("rate limited", { status: 429 });
+    }
+
+    assert.equal(url, "https://openai-test.openai.azure.com/openai/v1/images/edits");
+    assert.equal(options.headers["api-key"], "azure-openai-test-secret");
+    assert.equal(options.body.get("image"), null);
+    const image = options.body.get("image[]");
+    assert.equal(image.type, "image/png");
+    assert.deepEqual(new Uint8Array(await image.arrayBuffer()), input);
+    return Response.json({ data: [{ b64_json: Buffer.from(refined).toString("base64") }] });
+  };
+  try {
+    const response = await worker.fetch(new Request("https://example.test/api/device/refinements", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer device-secret",
+        "Content-Type": "image/png",
+        "Content-Length": String(input.byteLength),
+        "X-Device-Id": "ian-kobo",
+        "X-Refinement-Key": "1234567890abcdef",
+      },
+      body: input,
+    }), refineEnv);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-Refinement-Model"), "gpt-image-2");
+    assert.deepEqual(attempted, [
+      "MAI-Image-2.5-Pro",
+      "MAI-Image-2.5",
+      "MAI-Image-2.5-Flash",
+      "gpt-image-2",
+    ]);
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), refined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a non-moderation MAI 400 skips directly to Azure gpt-image-2", async () => {
+  const input = makePng();
+  const refined = makePng([chunk("tEXt", new TextEncoder().encode("gpt-image-2-after-400"))]);
+  const images = memoryKv();
+  const refineEnv = {
+    ...env,
+    AZURE_MAI_API_KEY: "azure-mai-test-secret",
+    AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com",
+    AZURE_OPENAI_API_KEY: "azure-openai-test-secret",
+    AZURE_OPENAI_ENDPOINT: "https://openai-test.openai.azure.com",
+    MAILBOX_IMAGES: images,
+  };
+  const attempted = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    attempted.push(options.body.get("model"));
+    if (url === "https://mai-test.services.ai.azure.com/mai/v1/images/edits") {
+      return Response.json({
+        error: { code: "invalid_request_error", message: "unsupported request parameter" },
+      }, { status: 400 });
+    }
+    return Response.json({ data: [{ b64_json: Buffer.from(refined).toString("base64") }] });
+  };
+  try {
+    const response = await worker.fetch(new Request("https://example.test/api/device/refinements", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer device-secret",
+        "Content-Type": "image/png",
+        "Content-Length": String(input.byteLength),
+        "X-Device-Id": "ian-kobo",
+        "X-Refinement-Key": "f0f0f0f0f0f0f0f0",
+      },
+      body: input,
+    }), refineEnv);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-Refinement-Model"), "gpt-image-2");
+    assert.deepEqual(attempted, ["MAI-Image-2.5-Pro", "gpt-image-2"]);
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), refined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a moderation 400 from the first tier does not cross providers", async () => {
   const input = makePng();
   const images = memoryKv();
   const refineEnv = {
     ...env,
     AZURE_MAI_API_KEY: "azure-mai-test-secret",
     AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com",
+    AZURE_OPENAI_API_KEY: "azure-openai-test-secret",
+    AZURE_OPENAI_ENDPOINT: "https://openai-test.openai.azure.com",
     MAILBOX_IMAGES: images,
   };
   let calls = 0;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {
     calls += 1;
-    return new Response("moderation blocked", { status: 400 });
+    return Response.json({
+      error: {
+        code: "content_policy_violation",
+        message: "The request was rejected by the safety system.",
+      },
+    }, { status: 400 });
   };
   try {
     const response = await worker.fetch(new Request("https://example.test/api/device/refinements", {
