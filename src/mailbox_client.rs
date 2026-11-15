@@ -17,9 +17,32 @@ const MAX_CACHE_FILES: usize = 64;
 const MAX_CACHE_BYTES: u64 = 96 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefineMode {
+    Refine,
+    Redraw,
+}
+
+impl RefineMode {
+    fn header(self) -> &'static str {
+        match self {
+            Self::Refine => "refine",
+            Self::Redraw => "redraw",
+        }
+    }
+
+    fn key(self, png: &[u8]) -> String {
+        match self {
+            Self::Refine => refinement_key(png),
+            Self::Redraw => fnv_key(b"redraw:".iter().chain(png.iter()).copied()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryKind {
     Message,
     Refinement,
+    Redraw,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +123,7 @@ fn parse_history(bytes: &[u8], next_cursor: Option<String>) -> io::Result<Histor
             kind: match fields[0] {
                 "message" => HistoryKind::Message,
                 "refinement" => HistoryKind::Refinement,
+                "redraw" => HistoryKind::Redraw,
                 _ => return Err(invalid_history()),
             },
             id: positive_id(fields[1]).ok_or_else(invalid_history)?,
@@ -125,6 +149,7 @@ fn history_tsv(items: &[HistoryEntry]) -> String {
             let kind = match entry.kind {
                 HistoryKind::Message => "message",
                 HistoryKind::Refinement => "refinement",
+                HistoryKind::Redraw => "redraw",
             };
             format!(
                 "{kind}\t{}\t{}\t{}\t{}\t{}\n",
@@ -152,10 +177,10 @@ impl HistoryCache {
     pub fn image_path(&self, kind: HistoryKind, id: u64, side: HistoryImageSide) -> PathBuf {
         let name = match (kind, side) {
             (HistoryKind::Message, _) => format!("message-{id}.png"),
-            (HistoryKind::Refinement, HistoryImageSide::Output) => {
+            (HistoryKind::Refinement | HistoryKind::Redraw, HistoryImageSide::Output) => {
                 format!("refinement-{id}-output.png")
             }
-            (HistoryKind::Refinement, HistoryImageSide::Input) => {
+            (HistoryKind::Refinement | HistoryKind::Redraw, HistoryImageSide::Input) => {
                 format!("refinement-{id}-input.png")
             }
         };
@@ -424,10 +449,10 @@ impl MailboxClient {
         }
         let route = match (kind, side) {
             (HistoryKind::Message, _) => format!("messages/{id}.png"),
-            (HistoryKind::Refinement, HistoryImageSide::Output) => {
+            (HistoryKind::Refinement | HistoryKind::Redraw, HistoryImageSide::Output) => {
                 format!("refinements/{id}/output.png")
             }
-            (HistoryKind::Refinement, HistoryImageSide::Input) => {
+            (HistoryKind::Refinement | HistoryKind::Redraw, HistoryImageSide::Input) => {
                 format!("refinements/{id}/input.png")
             }
         };
@@ -444,6 +469,15 @@ impl MailboxClient {
         &self,
         input_path: impl AsRef<Path>,
         output_path: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        self.refine_png_with_mode(input_path, output_path, RefineMode::Refine)
+    }
+
+    pub fn refine_png_with_mode(
+        &self,
+        input_path: impl AsRef<Path>,
+        output_path: impl AsRef<Path>,
+        mode: RefineMode,
     ) -> io::Result<()> {
         let png = fs::read(input_path)?;
         if png.len() > MAX_PAGE_BYTES {
@@ -464,7 +498,8 @@ impl MailboxClient {
             .set("Authorization", &format!("Bearer {}", self.device_token))
             .set("Content-Type", "image/png")
             .set("X-Device-Id", &self.device_id)
-            .set("X-Refinement-Key", &refinement_key(&png))
+            .set("X-Refinement-Mode", mode.header())
+            .set("X-Refinement-Key", &mode.key(&png))
             .send_bytes(&png)
             .map_err(http_error)?;
         download_png(response, output_path.as_ref())
@@ -586,8 +621,12 @@ fn is_png(bytes: &[u8]) -> bool {
 }
 
 fn refinement_key(bytes: &[u8]) -> String {
+    fnv_key(bytes.iter().copied())
+}
+
+fn fnv_key(bytes: impl IntoIterator<Item = u8>) -> String {
     let mut hash = 0xcbf29ce484222325u64;
-    for &byte in bytes {
+    for byte in bytes {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -739,8 +778,10 @@ mod tests {
 
     #[test]
     fn refines_png_with_stable_key_and_writes_returned_png() {
-        let refined = test_png();
-        let response = format!(
+        for mode in [None, Some(RefineMode::Refine), Some(RefineMode::Redraw)] {
+            let expected_mode = mode.unwrap_or(RefineMode::Refine);
+            let refined = test_png();
+            let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             refined.len()
         )
@@ -748,38 +789,60 @@ mod tests {
         .into_iter()
         .chain(refined.iter().copied())
         .collect::<Vec<_>>();
-        let response: &'static [u8] = Box::leak(response.into_boxed_slice());
-        let (base, requests) = mock_server(response);
-        let suffix = format!("{}-{}", std::process::id(), refinement_key(&test_png()));
-        let input = std::env::temp_dir().join(format!("mailbox-refine-input-{suffix}.png"));
-        let output = std::env::temp_dir().join(format!("mailbox-refine-output-{suffix}.png"));
-        fs::write(&input, test_png()).unwrap();
+            let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+            let (base, requests) = mock_server(response);
+            let suffix = format!("{}-{}", std::process::id(), expected_mode.key(&test_png()));
+            let input = std::env::temp_dir().join(format!("mailbox-refine-input-{suffix}.png"));
+            let output = std::env::temp_dir().join(format!("mailbox-refine-output-{suffix}.png"));
+            fs::write(&input, test_png()).unwrap();
 
-        let client = MailboxClient::new(base, "secret-device", "ian-kobo").unwrap();
-        client.refine_png(&input, &output).unwrap();
-        assert_eq!(fs::read(&output).unwrap(), refined);
-        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(request
-            .head
-            .starts_with("POST /api/device/refinements HTTP/1.1\r\n"));
-        assert!(request.head.contains("Authorization: Bearer "));
-        assert!(request.head.contains("Content-Type: image/png\r\n"));
-        assert!(request.head.contains("X-Device-Id: ian-kobo\r\n"));
-        assert!(request.head.contains(&format!(
-            "X-Refinement-Key: {}\r\n",
-            refinement_key(&test_png())
-        )));
-        assert_eq!(request.body, test_png());
-        let _ = fs::remove_file(input);
-        let _ = fs::remove_file(output);
+            let client = MailboxClient::new(base, "secret-device", "ian-kobo").unwrap();
+            match mode {
+                None => client.refine_png(&input, &output).unwrap(),
+                Some(mode) => client.refine_png_with_mode(&input, &output, mode).unwrap(),
+            }
+            assert_eq!(fs::read(&output).unwrap(), refined);
+            let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(request
+                .head
+                .starts_with("POST /api/device/refinements HTTP/1.1\r\n"));
+            assert!(request.head.contains("Authorization: Bearer "));
+            assert!(request.head.contains("Content-Type: image/png\r\n"));
+            assert!(request.head.contains("X-Device-Id: ian-kobo\r\n"));
+            assert!(request.head.contains(&format!(
+                "X-Refinement-Key: {}\r\n",
+                expected_mode.key(&test_png())
+            )));
+            assert!(request.head.contains(&format!(
+                "X-Refinement-Mode: {}\r\n",
+                expected_mode.header()
+            )));
+            assert_eq!(request.body, test_png());
+            let _ = fs::remove_file(input);
+            let _ = fs::remove_file(output);
+        }
     }
 
     #[test]
     fn refinement_key_is_stable_and_sensitive_to_image_bytes() {
         assert_eq!(refinement_key(&test_png()), refinement_key(&test_png()));
+        assert_eq!(RefineMode::Refine.key(&test_png()), "6cce4056aa1190a4");
+        assert_eq!(RefineMode::Redraw.key(&test_png()), "d1bd3a5d0914f967");
+        assert_ne!(
+            RefineMode::Refine.key(&test_png()),
+            RefineMode::Redraw.key(&test_png())
+        );
+        assert_eq!(
+            RefineMode::Redraw.key(&test_png()),
+            RefineMode::Redraw.key(&test_png())
+        );
         let mut changed = test_png();
         changed.push(1);
         assert_ne!(refinement_key(&test_png()), refinement_key(&changed));
+        assert_ne!(
+            RefineMode::Redraw.key(&test_png()),
+            RefineMode::Redraw.key(&changed)
+        );
     }
 
     #[test]
@@ -892,6 +955,20 @@ mod tests {
                 "refinements/2/input.png",
                 "refinement-2-input.png",
             ),
+            (
+                HistoryKind::Redraw,
+                3,
+                HistoryImageSide::Output,
+                "refinements/3/output.png",
+                "refinement-3-output.png",
+            ),
+            (
+                HistoryKind::Redraw,
+                3,
+                HistoryImageSide::Input,
+                "refinements/3/input.png",
+                "refinement-3-input.png",
+            ),
         ] {
             let (base, requests) =
                 mock_server(history_response(&test_png(), "Content-Type: image/png\r\n"));
@@ -907,6 +984,14 @@ mod tests {
                 .contains("Authorization: Bearer history-secret\r\n"));
             assert_eq!(fs::read(&path).unwrap(), test_png());
             assert_eq!(cache.fetch_image(&client, kind, id, side).unwrap(), path);
+            if kind == HistoryKind::Redraw {
+                assert_eq!(
+                    cache
+                        .fetch_image(&client, HistoryKind::Refinement, id, side)
+                        .unwrap(),
+                    path
+                );
+            }
             assert!(!path.with_extension("png.part").exists());
         }
         fs::remove_dir_all(dir).unwrap();
@@ -916,9 +1001,17 @@ mod tests {
     fn history_cache_snapshot_survives_offline_and_invalid_cache_fails_cleanly() {
         let dir = history_test_dir("offline");
         let cache = HistoryCache::new(&dir);
-        let (base, _requests) = mock_server(history_response(b"message\t1\tlegacy\t0\t0\t\n", ""));
+        let (base, _requests) = mock_server(history_response(
+            b"message\t1\tlegacy\t0\t0\t\nredraw\t2\t2026-11-15T00:00:00Z\t1\t0\tMAI-Image-2.6\n",
+            "",
+        ));
         let online = MailboxClient::new(base, "secret", "kobo").unwrap();
         let page = cache.list_history(&online, None, 20).unwrap();
+        assert_eq!(page.items[1].kind, HistoryKind::Redraw);
+        assert_eq!(
+            history_tsv(&page.items).as_bytes(),
+            fs::read(cache.root.join("index.tsv")).unwrap()
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);

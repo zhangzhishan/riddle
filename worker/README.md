@@ -38,8 +38,8 @@ key, and an `image[]` form field. MAI models are **not** reachable through the
 
 The known Azure OpenAI deployment names `gpt-image-2.5-sunburst` and
 `gpt-image-2.5-flare` reject `input_fidelity`, so the Worker omits that field
-only for those two names. MAI, legacy `gpt-image-2`, and custom deployment names
-keep `input_fidelity=high`. All deployments retain `quality=low`,
+only for those two names in `refine` mode. MAI, legacy `gpt-image-2`, and custom deployment names
+keep `input_fidelity=high` in `refine` mode; `redraw` omits it for every deployment. All deployments retain `quality=low`,
 `size=1024x1536`, and PNG output. A custom alias for either GPT Image 2.5 model
 requires an explicit compatibility update before use.
 
@@ -53,9 +53,12 @@ The Python service under `server/` remains useful for local/LAN deployment and t
 - `Content-Length` up to 4 MiB
 - `X-Device-Id`
 - `X-Refinement-Key`: 16 lowercase hexadecimal characters, derived deterministically from the PNG
+- Optional `X-Refinement-Mode`: `refine` (default, AI润色 preserves the drawing) or `redraw` (AI重画 reimagines the scene). Other values return `400` after device authentication.
 - raw PNG request body
 
 Success returns `200 image/png`. `X-Refinement-Cache` is `miss` for a new edit and `hit` when KV supplies a previous successful result; `X-Refinement-Model` names the tier that served it. The UI requires two deliberate stylus taps before starting; a failed request preserves the drawing and is retryable.
+
+`X-Refinement-Mode` echoes the mode on both cache hits and misses. Modes have independent KV and D1 keys, while `refine` retains legacy keys. Apply `0005_refinement_mode.sql` before serving the updated Worker; existing records default to `refine`. Family history displays mode and model.
 
 ## Test
 
@@ -103,7 +106,7 @@ Private responses use `Cache-Control: no-store`, capability tokens are compared 
 newline-terminated TSV (`kind`, `id`, `created_at`, `input_available`,
 `has_reply`, `model`), newest first. `limit` is 1–50; an optional
 `X-Next-Cursor` response header identifies the next page. Legacy refinements
-sort after timestamped records. Apply migration `0004_history_indexes.sql`.
+sort after timestamped records. Kinds are `message`, `refinement` (AI润色), and `redraw` (AI重画). Both AI kinds share refinement IDs and kind rank `1`, preserving gap-free pagination. Apply migrations through `0005_refinement_mode.sql` (including `0004_history_indexes.sql`).
 
 Download PNGs using `GET /api/device/history/messages/<id>.png` or
 `GET /api/device/history/refinements/<id>/(input|output).png` (no query parameters).

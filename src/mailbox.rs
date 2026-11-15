@@ -5,7 +5,7 @@
 //! which keeps accidental sends and error recovery host-testable.
 
 use crate::fb::{SCREEN_H, SCREEN_W};
-use crate::mailbox_client::{HistoryEntry, HistoryImageSide, HistoryKind, HistoryPage};
+use crate::mailbox_client::{HistoryEntry, HistoryImageSide, HistoryKind, HistoryPage, RefineMode};
 
 pub const ACTION_BAR_H: i32 = 180;
 const AUTO_POLL_MS: u64 = 60_000;
@@ -15,7 +15,7 @@ const MAILBOX_FONT_TTF: &[u8] = include_bytes!("../fonts/mailbox/MaShanZheng-Reg
 pub enum Retry {
     Upload,
     Poll,
-    Refine,
+    Refine(RefineMode),
     History,
     HistoryItem,
 }
@@ -32,10 +32,10 @@ pub struct HistoryView {
 pub enum Screen {
     Compose,
     ConfirmSend,
-    ConfirmRefine,
+    ConfirmRefine(RefineMode),
     ConfirmClear,
     Sending,
-    Refining,
+    Refining(RefineMode),
     CheckingInbox,
     Reply { id: u64, body: String },
     Refined,
@@ -51,7 +51,7 @@ pub enum Action {
     None,
     Draw,
     Upload,
-    Refine,
+    Refine(RefineMode),
     Poll { after: u64 },
     ClearCanvas,
     DismissReply,
@@ -70,6 +70,7 @@ pub enum ComposeTarget {
     Canvas,
     Send,
     Refine,
+    Redraw,
     History,
     Inbox,
     Clear,
@@ -111,14 +112,16 @@ impl MailboxState {
         if y < bar_y {
             return ComposeTarget::Canvas;
         }
-        let column = SCREEN_W as i32 / 5;
+        let column = SCREEN_W as i32 / 6;
         if x < column {
             ComposeTarget::Send
         } else if x < column * 2 {
             ComposeTarget::Refine
         } else if x < column * 3 {
-            ComposeTarget::History
+            ComposeTarget::Redraw
         } else if x < column * 4 {
+            ComposeTarget::History
+        } else if x < column * 5 {
             ComposeTarget::Inbox
         } else {
             ComposeTarget::Clear
@@ -140,7 +143,11 @@ impl MailboxState {
                     Action::None
                 }
                 ComposeTarget::Refine if self.has_ink => {
-                    self.screen = Screen::ConfirmRefine;
+                    self.screen = Screen::ConfirmRefine(RefineMode::Refine);
+                    Action::None
+                }
+                ComposeTarget::Redraw if self.has_ink => {
+                    self.screen = Screen::ConfirmRefine(RefineMode::Redraw);
                     Action::None
                 }
                 ComposeTarget::History => {
@@ -174,10 +181,11 @@ impl MailboxState {
                     Action::None
                 }
             }
-            Screen::ConfirmRefine => {
+            Screen::ConfirmRefine(mode) => {
                 if confirm_target(x, y) {
-                    self.screen = Screen::Refining;
-                    Action::Refine
+                    let mode = *mode;
+                    self.screen = Screen::Refining(mode);
+                    Action::Refine(mode)
                 } else {
                     self.screen = Screen::Compose;
                     Action::None
@@ -237,8 +245,10 @@ impl MailboxState {
                         self.screen = Screen::LoadingHistory;
                         return Action::LoadHistory;
                     }
-                    2 if view.items[view.index].kind == HistoryKind::Refinement
-                        && view.items[view.index].input_available =>
+                    2 if matches!(
+                        view.items[view.index].kind,
+                        HistoryKind::Refinement | HistoryKind::Redraw
+                    ) && view.items[view.index].input_available =>
                     {
                         view.side = match view.side {
                             HistoryImageSide::Output => HistoryImageSide::Input,
@@ -295,9 +305,9 @@ impl MailboxState {
                                 after: self.last_reply_id,
                             }
                         }
-                        Retry::Refine => {
-                            self.screen = Screen::Refining;
-                            Action::Refine
+                        Retry::Refine(mode) => {
+                            self.screen = Screen::Refining(mode);
+                            Action::Refine(mode)
                         }
                         Retry::History | Retry::HistoryItem => {
                             self.screen = Screen::LoadingHistory;
@@ -321,9 +331,10 @@ impl MailboxState {
                     Action::None
                 }
             }
-            Screen::Sending | Screen::Refining | Screen::CheckingInbox | Screen::LoadingHistory => {
-                Action::None
-            }
+            Screen::Sending
+            | Screen::Refining(_)
+            | Screen::CheckingInbox
+            | Screen::LoadingHistory => Action::None,
         }
     }
 
@@ -348,15 +359,15 @@ impl MailboxState {
     }
 
     pub fn refine_finished(&mut self, result: Result<(), String>) -> Action {
-        if !matches!(self.screen, Screen::Refining) {
+        let Screen::Refining(mode) = self.screen else {
             return Action::None;
-        }
+        };
         match result {
             Ok(()) => self.screen = Screen::Refined,
             Err(message) => {
                 self.screen = Screen::Error {
                     message,
-                    retry: Retry::Refine,
+                    retry: Retry::Refine(mode),
                 };
             }
         }
@@ -468,7 +479,8 @@ fn history_summary(view: &HistoryView) -> String {
     let title = match (entry.kind, view.side) {
         (HistoryKind::Message, _) => "纸飞机",
         (HistoryKind::Refinement, HistoryImageSide::Output) => "AI 润色",
-        (HistoryKind::Refinement, HistoryImageSide::Input) => "AI 原图",
+        (HistoryKind::Redraw, HistoryImageSide::Output) => "AI 重画",
+        (HistoryKind::Refinement | HistoryKind::Redraw, HistoryImageSide::Input) => "AI 原图",
     };
     let reply = if entry.kind == HistoryKind::Message && entry.has_reply {
         " • 有回信"
@@ -726,10 +738,15 @@ pub fn run() -> std::io::Result<()> {
         });
     }
 
-    fn start_refine(tx: mpsc::Sender<NetResult>, page: PathBuf, refined: PathBuf) {
+    fn start_refine(
+        tx: mpsc::Sender<NetResult>,
+        page: PathBuf,
+        refined: PathBuf,
+        mode: RefineMode,
+    ) {
         std::thread::spawn(move || {
             let result = MailboxClient::from_env()
-                .and_then(|client| client.refine_png(page, refined))
+                .and_then(|client| client.refine_png_with_mode(page, refined, mode))
                 .map_err(|error| error.to_string());
             let _ = tx.send(NetResult::Refine(result));
         });
@@ -803,15 +820,15 @@ pub fn run() -> std::io::Result<()> {
         surf.fill_rect(0, y, SCREEN_W, 3, BLACK);
         match &state.screen {
             Screen::Compose => {
-                let column = SCREEN_W / 5;
-                for divider in 1..5 {
+                let column = SCREEN_W / 6;
+                for divider in 1..6 {
                     surf.fill_rect(column * divider, y, 2, ACTION_BAR_H as usize, BLACK);
                 }
-                for (index, label) in ["发送", "AI润色", "历史", "收信", "清空"]
+                for (index, label) in ["发送", "AI润色", "AI重画", "历史", "收信", "清空"]
                     .iter()
                     .enumerate()
                 {
-                    draw_text(surf, font, label, 44.0, column * index + column / 2, y + 56);
+                    draw_text(surf, font, label, 40.0, column * index + column / 2, y + 56);
                 }
             }
             Screen::LoadingHistory => {
@@ -825,7 +842,9 @@ pub fn run() -> std::io::Result<()> {
             Screen::History(view) => {
                 let column = SCREEN_W / 5;
                 let entry = &view.items[view.index];
-                let toggle = if entry.kind == HistoryKind::Refinement && entry.input_available {
+                let toggle = if matches!(entry.kind, HistoryKind::Refinement | HistoryKind::Redraw)
+                    && entry.input_available
+                {
                     if view.side == HistoryImageSide::Output {
                         "看原图"
                     } else {
@@ -854,10 +873,14 @@ pub fn run() -> std::io::Result<()> {
                 draw_text(surf, font, "取消", 52.0, SCREEN_W / 4, y + 50);
                 draw_text(surf, font, "现在发送", 52.0, SCREEN_W * 3 / 4, y + 50);
             }
-            Screen::ConfirmRefine => {
+            Screen::ConfirmRefine(mode) => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
                 draw_text(surf, font, "取消", 52.0, SCREEN_W / 4, y + 50);
-                draw_text(surf, font, "开始润色", 52.0, SCREEN_W * 3 / 4, y + 50);
+                let label = match mode {
+                    RefineMode::Refine => "开始润色",
+                    RefineMode::Redraw => "开始重画",
+                };
+                draw_text(surf, font, label, 52.0, SCREEN_W * 3 / 4, y + 50);
             }
             Screen::ConfirmClear => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
@@ -865,10 +888,13 @@ pub fn run() -> std::io::Result<()> {
                 draw_text(surf, font, "清空画纸", 52.0, SCREEN_W * 3 / 4, y + 50);
             }
             Screen::Sending => draw_text(surf, font, "正在折纸飞机……", 52.0, SCREEN_W / 2, y + 50),
-            Screen::Refining => draw_text(
+            Screen::Refining(mode) => draw_text(
                 surf,
                 font,
-                "GPT 正在认真润色，大约要一两分钟……",
+                match mode {
+                    RefineMode::Refine => "AI 正在认真润色，大约要一两分钟……",
+                    RefineMode::Redraw => "AI 正在大幅重画，大约要一两分钟……",
+                },
                 38.0,
                 SCREEN_W / 2,
                 y + 58,
@@ -1093,7 +1119,7 @@ pub fn run() -> std::io::Result<()> {
                     false,
                 );
             }
-            Action::Refine => {
+            Action::Refine(mode) => {
                 *snapshot = Some(surface.copy_rect(0, 0, SCREEN_W, SCREEN_H));
                 let export = if base.is_some() {
                     write_canvas_png(surface, &page_path, SCREEN_H - ACTION_BAR_H as usize)
@@ -1103,7 +1129,12 @@ pub fn run() -> std::io::Result<()> {
                 if let Err(error) = export {
                     state.refine_finished(Err(error.to_string()));
                 } else {
-                    start_refine(net_tx.clone(), page_path.clone(), refined_path.clone());
+                    start_refine(
+                        net_tx.clone(),
+                        page_path.clone(),
+                        refined_path.clone(),
+                        mode,
+                    );
                 }
                 render_controls(surface, &font, state);
                 display.update(
@@ -1372,11 +1403,12 @@ mod tests {
     fn center(target: ComposeTarget) -> (i32, i32) {
         let y = SCREEN_H as i32 - ACTION_BAR_H / 2;
         match target {
-            ComposeTarget::Send => (SCREEN_W as i32 / 10, y),
-            ComposeTarget::Refine => (SCREEN_W as i32 * 3 / 10, y),
-            ComposeTarget::History => (SCREEN_W as i32 * 5 / 10, y),
-            ComposeTarget::Inbox => (SCREEN_W as i32 * 7 / 10, y),
-            ComposeTarget::Clear => (SCREEN_W as i32 * 9 / 10, y),
+            ComposeTarget::Send => (SCREEN_W as i32 / 12, y),
+            ComposeTarget::Refine => (SCREEN_W as i32 * 3 / 12, y),
+            ComposeTarget::Redraw => (SCREEN_W as i32 * 5 / 12, y),
+            ComposeTarget::History => (SCREEN_W as i32 * 7 / 12, y),
+            ComposeTarget::Inbox => (SCREEN_W as i32 * 9 / 12, y),
+            ComposeTarget::Clear => (SCREEN_W as i32 * 11 / 12, y),
             ComposeTarget::Canvas => (SCREEN_W as i32 / 2, 200),
             ComposeTarget::Outside => (-1, -1),
         }
@@ -1392,16 +1424,30 @@ mod tests {
             MailboxState::target(center(ComposeTarget::Canvas).0, 200),
             ComposeTarget::Canvas
         );
-        for target in [
+        for (index, target) in [
             ComposeTarget::Send,
             ComposeTarget::Refine,
+            ComposeTarget::Redraw,
             ComposeTarget::History,
             ComposeTarget::Inbox,
             ComposeTarget::Clear,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let (x, y) = center(target);
             assert_eq!(MailboxState::target(x, y), target);
+            let column = SCREEN_W as i32 / 6;
+            assert_eq!(MailboxState::target(index as i32 * column, y), target);
+            assert_eq!(
+                MailboxState::target((index as i32 + 1) * column - 1, y),
+                target
+            );
         }
+        assert_eq!(
+            MailboxState::target(SCREEN_W as i32, SCREEN_H as i32 - 1),
+            ComposeTarget::Outside
+        );
     }
 
     #[test]
@@ -1431,42 +1477,56 @@ mod tests {
 
     #[test]
     fn refine_requires_confirmation_preserves_ink_and_can_be_dismissed_or_retried() {
-        let mut state = MailboxState::new(0, 0);
-        let (x, y) = center(ComposeTarget::Refine);
-        assert_eq!(state.tap(x, y, 0), Action::None);
-        assert_eq!(state.screen, Screen::Compose);
+        for (target, mode) in [
+            (ComposeTarget::Refine, RefineMode::Refine),
+            (ComposeTarget::Redraw, RefineMode::Redraw),
+        ] {
+            let mut state = MailboxState::new(0, 0);
+            let (x, y) = center(target);
+            assert_eq!(state.tap(x, y, 0), Action::None);
+            assert_eq!(state.screen, Screen::Compose);
 
-        state.note_ink();
-        assert_eq!(state.tap(x, y, 0), Action::None);
-        assert_eq!(state.screen, Screen::ConfirmRefine);
-        let (x, y) = confirm();
-        assert_eq!(state.tap(x, y, 0), Action::Refine);
-        assert_eq!(state.screen, Screen::Refining);
-        assert_eq!(state.refine_finished(Ok(())), Action::None);
-        assert_eq!(state.screen, Screen::Refined);
-        assert!(state.has_ink);
-        assert_eq!(state.tap(200, 200, 1), Action::DismissRefinement);
-        assert_eq!(state.screen, Screen::Compose);
-        assert!(state.has_ink);
+            state.note_ink();
+            assert_eq!(state.tap(x, y, 0), Action::None);
+            assert_eq!(state.screen, Screen::ConfirmRefine(mode));
+            assert_eq!(state.tap(10, 10, 0), Action::None);
+            assert_eq!(state.screen, Screen::Compose);
+            assert!(state.has_ink);
+            assert_eq!(state.tap(x, y, 0), Action::None);
+            assert_eq!(state.screen, Screen::ConfirmRefine(mode));
+            let (x, y) = confirm();
+            assert_eq!(state.tap(x, y, 0), Action::Refine(mode));
+            assert_eq!(state.screen, Screen::Refining(mode));
+            assert_eq!(state.refine_finished(Ok(())), Action::None);
+            assert_eq!(state.screen, Screen::Refined);
+            assert!(state.has_ink);
+            assert_eq!(state.tap(200, 200, 1), Action::DismissRefinement);
+            assert_eq!(state.screen, Screen::Compose);
+            assert!(state.has_ink);
 
-        state.screen = Screen::Refined;
-        let (x, y) = confirm();
-        assert_eq!(state.tap(x, y, 1), Action::AdoptRefinement);
-        assert_eq!(state.screen, Screen::Compose);
-        assert!(state.has_ink);
+            state.screen = Screen::Refined;
+            let (x, y) = confirm();
+            assert_eq!(state.tap(x, y, 1), Action::AdoptRefinement);
+            assert_eq!(state.screen, Screen::Compose);
+            assert!(state.has_ink);
 
-        state.screen = Screen::Refining;
-        state.refine_finished(Err("offline".into()));
-        assert_eq!(
-            state.screen,
-            Screen::Error {
-                message: "offline".into(),
-                retry: Retry::Refine,
-            }
-        );
-        let (x, y) = confirm();
-        assert_eq!(state.tap(x, y, 2), Action::Refine);
-        assert_eq!(state.screen, Screen::Refining);
+            state.screen = Screen::Refining(mode);
+            state.refine_finished(Err("offline".into()));
+            assert_eq!(
+                state.screen,
+                Screen::Error {
+                    message: "offline".into(),
+                    retry: Retry::Refine(mode),
+                }
+            );
+            let (x, y) = confirm();
+            assert_eq!(state.tap(x, y, 2), Action::Refine(mode));
+            assert_eq!(state.screen, Screen::Refining(mode));
+            state.refine_finished(Err("offline".into()));
+            assert_eq!(state.tap(10, 10, 3), Action::None);
+            assert_eq!(state.screen, Screen::Compose);
+            assert!(state.has_ink);
+        }
     }
 
     #[test]
@@ -1608,6 +1668,11 @@ mod tests {
         for text in [
             "发送",
             "AI润色",
+            "AI重画",
+            "开始润色",
+            "开始重画",
+            "AI 正在认真润色，大约要一两分钟……",
+            "AI 正在大幅重画，大约要一两分钟……",
             "历史",
             "收信",
             "清空",
@@ -1633,6 +1698,8 @@ mod tests {
             (HistoryKind::Message, HistoryImageSide::Output),
             (HistoryKind::Refinement, HistoryImageSide::Output),
             (HistoryKind::Refinement, HistoryImageSide::Input),
+            (HistoryKind::Redraw, HistoryImageSide::Output),
+            (HistoryKind::Redraw, HistoryImageSide::Input),
         ] {
             for created_at in ["2026-01-23T00:00:00Z", "legacy"] {
                 let mut entry = history_entries().remove(0);
@@ -1685,7 +1752,8 @@ mod tests {
     fn open_history(has_ink: bool, next_cursor: Option<String>) -> MailboxState {
         let mut state = MailboxState::new(0, 0);
         state.has_ink = has_ink;
-        assert_eq!(history_tap(&mut state, 2), Action::OpenHistory);
+        let (x, y) = center(ComposeTarget::History);
+        assert_eq!(state.tap(x, y, 0), Action::OpenHistory);
         assert_eq!(state.screen, Screen::LoadingHistory);
         assert_eq!(state.has_ink, has_ink);
         assert_eq!(history_tap(&mut state, 4), Action::None);
@@ -1706,7 +1774,8 @@ mod tests {
         for has_ink in [false, true] {
             let mut state = MailboxState::new(0, 0);
             state.has_ink = has_ink;
-            assert_eq!(history_tap(&mut state, 2), Action::OpenHistory);
+            let (x, y) = center(ComposeTarget::History);
+            assert_eq!(state.tap(x, y, 0), Action::OpenHistory);
             assert_eq!(
                 state.history_page_finished(Ok(HistoryPage {
                     items: vec![],
@@ -1756,6 +1825,35 @@ mod tests {
         let mut state = open_history(false, None);
         assert_eq!(history_tap(&mut state, 4), Action::CloseHistory);
         assert!(!state.has_ink);
+    }
+
+    #[test]
+    fn redraw_history_toggles_original_and_output_with_mode_summary() {
+        let mut state = MailboxState::new(0, 0);
+        let mut entry = history_entries().remove(0);
+        entry.kind = HistoryKind::Redraw;
+        let view = HistoryView {
+            items: vec![entry],
+            next_cursor: None,
+            index: 0,
+            side: HistoryImageSide::Output,
+        };
+        assert_eq!(history_summary(&view), "AI 重画 • 第 1 张 • 11-15");
+        state.screen = Screen::History(view.clone());
+        state.history_shown = Some(view);
+        assert_eq!(history_tap(&mut state, 2), Action::LoadHistoryItem);
+        state.history_image_finished(Ok(()));
+        let shown = state.history_shown.as_ref().unwrap();
+        assert_eq!(shown.side, HistoryImageSide::Input);
+        assert_eq!(history_summary(shown), "AI 原图 • 第 1 张 • 11-15");
+        assert_eq!(history_tap(&mut state, 2), Action::LoadHistoryItem);
+        state.history_image_finished(Ok(()));
+        let mut view = state.history_shown.clone().unwrap();
+        assert_eq!(view.side, HistoryImageSide::Output);
+        assert_eq!(history_summary(&view), "AI 重画 • 第 1 张 • 11-15");
+        view.items[0].input_available = false;
+        state.screen = Screen::History(view);
+        assert_eq!(history_tap(&mut state, 2), Action::None);
     }
 
     #[test]
@@ -1820,7 +1918,8 @@ mod tests {
     fn history_errors_retry_exact_operation_or_cancel_to_last_shown() {
         let mut state = MailboxState::new(0, 0);
         state.has_ink = true;
-        history_tap(&mut state, 2);
+        let (x, y) = center(ComposeTarget::History);
+        state.tap(x, y, 0);
         state.history_page_finished(Err("offline".into()));
         assert!(matches!(
             state.screen,
@@ -1879,10 +1978,12 @@ mod tests {
             Screen::History(view),
             Screen::ConfirmAdoptHistory,
             Screen::ConfirmSend,
-            Screen::ConfirmRefine,
+            Screen::ConfirmRefine(RefineMode::Refine),
+            Screen::ConfirmRefine(RefineMode::Redraw),
             Screen::ConfirmClear,
             Screen::Sending,
-            Screen::Refining,
+            Screen::Refining(RefineMode::Refine),
+            Screen::Refining(RefineMode::Redraw),
             Screen::CheckingInbox,
             Screen::Refined,
             Screen::Reply {

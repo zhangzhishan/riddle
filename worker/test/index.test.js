@@ -76,7 +76,9 @@ function memoryRefinementDb() {
           if (!sql.includes("INSERT OR IGNORE INTO refinements")) {
             throw new Error(`unexpected run SQL: ${sql}`);
           }
-          const [device_id, refinement_key, input_key, output_key, model, created_at] = bindings;
+          const [device_id, refinement_key, input_key, output_key, model, mode, created_at] = bindings;
+          assert.match(sql, /model, mode, created_at/);
+          assert.ok(["refine", "redraw"].includes(mode));
           const existing = rows.find((row) => (
             row.device_id === device_id && row.refinement_key === refinement_key
           ));
@@ -88,6 +90,7 @@ function memoryRefinementDb() {
               input_key,
               output_key,
               model,
+              mode,
               created_at,
               input_available: 1,
             });
@@ -116,7 +119,7 @@ const env = {
 };
 
 function historyDb(messages = [], refinements = [], replies = []) {
-  const migrations = ["0001_init.sql", "0002_refinement_history.sql", "0003_refinement_legacy_inputs.sql", "0004_history_indexes.sql"];
+  const migrations = ["0001_init.sql", "0002_refinement_history.sql", "0003_refinement_legacy_inputs.sql", "0004_history_indexes.sql", "0005_refinement_mode.sql"];
   const schema = migrations.map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8")).join("\n");
   return {
     prepare(sql) {
@@ -182,6 +185,7 @@ function historyFixtures() {
   const messages = [1, 2, 3].map((id) => ({ id, device_id: "kobo", image_key: `message-${id}`, created_at: timestamp }));
   const refinements = [1, 2, 3, 4, 5].map((id) => ({ id, device_id: "kobo", refinement_key: `key-${id}`,
     input_key: `input-${id}`, output_key: `output-${id}`, input_available: id === 3 ? 0 : 1,
+    mode: id === 2 || id === 4 ? "redraw" : "refine",
     model: id === 3 ? "old\tmodel\r\n" : "MAI-Image-2.6", created_at: id >= 3 ? "legacy" : timestamp }));
   const replies = [{ id: 1, message_id: 2, body: "hello", created_at: timestamp }];
   return { ...env, MAILBOX_DB: historyDb(messages, refinements, replies), MAILBOX_IMAGES: memoryKv() };
@@ -206,7 +210,7 @@ test("device history uses real SQLite ordering and gap-free keyset pagination, l
     items.push(...fields);
     cursor = response.headers.get("X-Next-Cursor");
   } while (cursor);
-  assert.deepEqual(items.map((row) => `${row[0]}-${row[1]}`), ["message-3", "message-2", "message-1", "refinement-2", "refinement-1", "refinement-5", "refinement-4", "refinement-3"]);
+  assert.deepEqual(items.map((row) => `${row[0]}-${row[1]}`), ["message-3", "message-2", "message-1", "redraw-2", "refinement-1", "refinement-5", "redraw-4", "refinement-3"]);
   assert.equal(items[1][4], "1");
   assert.equal(items[0][4], "0");
   assert.equal(items.at(-1)[2], "legacy");
@@ -220,8 +224,8 @@ test("device history uses real SQLite ordering and gap-free keyset pagination, l
 test("device history downloads message and both refinement sides, rejects absent images", async () => {
   const historyEnv = historyFixtures();
   const png = makePng();
-  for (const key of ["message-1", "input-1", "output-1", "output-3"]) await historyEnv.MAILBOX_IMAGES.put(key, png);
-  for (const path of ["/messages/1.png", "/refinements/1/input.png", "/refinements/1/output.png", "/refinements/3/output.png"]) {
+  for (const key of ["message-1", "input-1", "output-1", "input-2", "output-2", "output-3"]) await historyEnv.MAILBOX_IMAGES.put(key, png);
+  for (const path of ["/messages/1.png", "/refinements/1/input.png", "/refinements/1/output.png", "/refinements/2/input.png", "/refinements/2/output.png", "/refinements/3/output.png"]) {
     const response = await worker.fetch(deviceHistoryRequest(path), historyEnv);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("Content-Type"), "image/png");
@@ -264,7 +268,7 @@ function memoryKv() {
   };
 }
 
-function refinementRequest(input) {
+function refinementRequest(input, mode) {
   return new Request("https://example.test/api/device/refinements", {
     method: "POST",
     headers: {
@@ -273,6 +277,7 @@ function refinementRequest(input) {
       "Content-Length": String(input.byteLength),
       "X-Device-Id": "ian-kobo",
       "X-Refinement-Key": "1234567890abcdef",
+      ...(mode === undefined ? {} : { "X-Refinement-Mode": mode }),
     },
     body: input,
   });
@@ -288,6 +293,111 @@ function openAiRefinementEnv(overrides = {}) {
     ...overrides,
   };
 }
+
+test("refinement mode validation is strict and follows device authentication", async () => {
+  const originalFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = async () => { upstreamCalls += 1; throw new Error("unexpected upstream"); };
+  try {
+    for (const mode of ["", "REFINE", "REDRAW", "other", "refine,redraw", "null"]) {
+      const refineEnv = openAiRefinementEnv();
+      const request = refinementRequest(makePng(), mode);
+      const response = await worker.fetch(request, refineEnv);
+      assert.equal(response.status, 400, JSON.stringify(mode));
+      assert.equal(await response.text(), "invalid refinement mode\n");
+      const unauthorized = refinementRequest(makePng(), mode);
+      unauthorized.headers.set("Authorization", "Bearer wrong");
+      assert.equal((await worker.fetch(unauthorized, refineEnv)).status, 401);
+      assert.equal(refineEnv.MAILBOX_DB.rows.length, 0);
+      assert.equal(refineEnv.MAILBOX_IMAGES.values.size, 0);
+    }
+    assert.equal(upstreamCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("refine and redraw isolate identical PNG keys, prompts, metadata and history", async () => {
+  const input = makePng();
+  const outputs = [makePng([chunk("tEXt", new TextEncoder().encode("refine"))]),
+    makePng([chunk("tEXt", new TextEncoder().encode("redraw"))])];
+  const refineEnv = openAiRefinementEnv({
+    AZURE_MAI_API_KEY: "mai-test-secret", AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com",
+  });
+  const originalFetch = globalThis.fetch;
+  const forms = [];
+  globalThis.fetch = async (_url, options) => {
+    forms.push(options.body);
+    return Response.json({ data: [{ b64_json: Buffer.from(outputs[forms.length - 1]).toString("base64") }] });
+  };
+  try {
+    for (const [index, mode] of ["refine", "redraw"].entries()) {
+      const first = await worker.fetch(refinementRequest(input, mode), refineEnv);
+      assert.equal(first.status, 200);
+      assert.equal(first.headers.get("X-Refinement-Cache"), "miss");
+      assert.equal(first.headers.get("X-Refinement-Mode"), mode);
+      assert.deepEqual(new Uint8Array(await first.arrayBuffer()), outputs[index]);
+      const key = `${mode === "redraw" ? "redraw-" : ""}1234567890abcdef`;
+      assert.deepEqual(refineEnv.MAILBOX_IMAGES.values.get(`refinement-inputs/ian-kobo/${key}.png`), input);
+      assert.deepEqual(refineEnv.MAILBOX_IMAGES.metadata.get(`refinements/ian-kobo/${key}.png`), {
+        contentType: "image/png", role: "output", model: "MAI-Image-2.6", mode,
+      });
+    }
+    assert.equal(forms.length, 2);
+    assert.equal(forms[0].get("input_fidelity"), "high");
+    assert.match(forms[0].get("prompt"), /preserving the original subject, composition/);
+    assert.equal(forms[1].has("input_fidelity"), false);
+    const prompt = forms[1].get("prompt");
+    for (const phrase of [/boldly redraw and reimagine the entire scene/, /proportions/, /expressive poses/,
+      /perspective/, /lighting/, /textures/, /complete imaginative environment/, /handwritten words/,
+      /Chinese handwriting/, /sketch with words/, /Do not merely reproduce or typeset/, /weapons/,
+      /age-appropriate/, /grayscale on e-ink/]) assert.match(prompt, phrase);
+    assert.deepEqual(refineEnv.MAILBOX_DB.rows.map(({ refinement_key, mode }) => ({ refinement_key, mode })), [
+      { refinement_key: "1234567890abcdef", mode: "refine" },
+      { refinement_key: "redraw:1234567890abcdef", mode: "redraw" },
+    ]);
+    const database = historyDb([], refineEnv.MAILBOX_DB.rows);
+    assert.deepEqual((await database.prepare("SELECT mode FROM refinements ORDER BY id").all()).results,
+      [{ mode: "refine" }, { mode: "redraw" }]);
+    for (const mode of [undefined, "refine", "redraw"]) {
+      const cached = await worker.fetch(refinementRequest(input, mode), refineEnv);
+      assert.equal(cached.headers.get("X-Refinement-Cache"), "hit");
+      assert.equal(cached.headers.get("X-Refinement-Mode"), mode ?? "refine");
+      assert.deepEqual(new Uint8Array(await cached.arrayBuffer()), outputs[mode === "redraw" ? 1 : 0]);
+    }
+    assert.equal(forms.length, 2);
+    assert.equal(refineEnv.MAILBOX_DB.rows.length, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("redraw omits input fidelity throughout every MAI and OpenAI fallback tier", async () => {
+  const refineEnv = openAiRefinementEnv({
+    AZURE_MAI_API_KEY: "mai-test-secret", AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com",
+  });
+  const expected = [...refinementModels({}), ...azureOpenAiRefinementModels({})];
+  const models = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, options) => {
+    models.push(options.body.get("model"));
+    assert.equal(options.body.has("input_fidelity"), false);
+    assert.match(options.body.get("prompt"), /boldly redraw/);
+    assert.equal(options.body.get("moderation"), "auto");
+    return models.length === expected.length
+      ? Response.json({ data: [{ b64_json: Buffer.from(makePng()).toString("base64") }] })
+      : new Response("capacity", { status: 429 });
+  };
+  try {
+    const response = await worker.fetch(refinementRequest(makePng(), "redraw"), refineEnv);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-Refinement-Mode"), "redraw");
+    assert.equal(response.headers.get("X-Refinement-Model"), "gpt-image-2");
+    assert.deepEqual(models, expected);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("PNG validator accepts a complete PNG", () => {
   assert.doesNotThrow(() => validatePng(makePng()));
@@ -361,7 +471,15 @@ test("refinement history renders protected before-and-after pairs safely", () =>
   assert.match(html, /\/refinements\/7\/output\.png/);
   assert.match(html, /ian&lt;script&gt;/);
   assert.match(html, /MAI&lt;Pro&gt;/);
+  assert.match(html, /模式：AI 润色 · 模型：MAI&lt;Pro&gt;/);
   assert.doesNotMatch(html, /ian<script>/);
+  const redraw = renderRefinementHistory([{
+    id: 9, device_id: "ian-kobo", mode: "redraw", model: '<img src=x onerror="alert(1)">',
+    created_at: "2026-11-15T00:00:00Z", input_available: 1,
+  }]);
+  assert.match(redraw, /模式：AI 大幅重画 · 模型：&lt;img/);
+  assert.doesNotMatch(redraw, /<img src=x/);
+  assert.doesNotMatch(renderRefinementHistory([{ id: 10, mode: "<script>" }]), /<script>/);
 
   const legacy = renderRefinementHistory([{
     id: 8,
@@ -499,12 +617,14 @@ test("device can refine a PNG through MAI-Image-2.6 and retries use the KV cache
     assert.equal(first.status, 200);
     assert.equal(first.headers.get("Content-Type"), "image/png");
     assert.equal(first.headers.get("X-Refinement-Cache"), "miss");
+    assert.equal(first.headers.get("X-Refinement-Mode"), "refine");
     assert.equal(first.headers.get("X-Refinement-Model"), "MAI-Image-2.6");
     assert.deepEqual(new Uint8Array(await first.arrayBuffer()), refined);
 
     const second = await worker.fetch(request(), refineEnv);
     assert.equal(second.status, 200);
     assert.equal(second.headers.get("X-Refinement-Cache"), "hit");
+    assert.equal(second.headers.get("X-Refinement-Mode"), "refine");
     assert.equal(second.headers.get("X-Refinement-Model"), "MAI-Image-2.6");
     assert.deepEqual(new Uint8Array(await second.arrayBuffer()), refined);
     assert.equal(openAiCalls, 1);

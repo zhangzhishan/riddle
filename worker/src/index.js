@@ -24,6 +24,11 @@ const REFINE_PROMPT = `Use the input in one of two ways:
 2. If it is mainly handwritten words or a written scene request, including Chinese handwriting, read the words as the image prompt and generate the picture they describe. Do not merely typeset or reproduce the handwritten words unless the request explicitly asks for visible text.
 In either case, use clean linework, coherent colors, gentle shading, and a simple supportive background. Do not add logos, watermarks, frightening imagery, weapons, or unrelated characters. Keep it warm, playful, age-appropriate, and use strong value contrast so it remains readable in grayscale.`;
 
+const REDRAW_PROMPT = `Use the input in one of two ways:
+1. If it is mainly a child's sketch or drawing, use it as creative inspiration for the core subject, characters, and story idea, and boldly redraw and reimagine the entire scene into a rich, vivid, dynamically composed children's-book illustration. Freely upgrade proportions, expressive poses, perspective, lighting, textures, and details. Build a complete imaginative environment and background instead of tracing the original rough lines or keeping blank paper.
+2. If it contains handwritten words, including Chinese handwriting, or a sketch with words, read the words as the scene or story prompt and generate a richly detailed, imaginative illustration of what they describe. Do not merely reproduce or typeset the handwritten words unless explicitly requested.
+In either case, do not add logos, watermarks, frightening imagery, weapons, or unrelated characters. Keep it warm, playful, age-appropriate, and use strong value contrast so it remains clearly readable in grayscale on e-ink.`;
+
 const STYLE = `:root {
   color-scheme: light;
   font-family: ui-rounded, "SF Pro Rounded", system-ui, -apple-system, sans-serif;
@@ -352,6 +357,7 @@ async function recordRefinementHistory(env, {
   inputKey,
   outputKey,
   model,
+  mode,
   input,
   output,
 }) {
@@ -360,14 +366,14 @@ async function recordRefinementHistory(env, {
       metadata: { contentType: "image/png", role: "input" },
     }),
     env.MAILBOX_IMAGES.put(outputKey, output, {
-      metadata: { contentType: "image/png", role: "output", model },
+      metadata: { contentType: "image/png", role: "output", model, mode },
     }),
   ]);
   await env.MAILBOX_DB.prepare(
     `INSERT OR IGNORE INTO refinements
-       (device_id, refinement_key, input_key, output_key, model, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).bind(deviceId, refinementKey, inputKey, outputKey, model, utcTimestamp()).run();
+       (device_id, refinement_key, input_key, output_key, model, mode, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).bind(deviceId, refinementKey, inputKey, outputKey, model, mode, utcTimestamp()).run();
 }
 
 async function handleUpload(request, env) {
@@ -420,15 +426,15 @@ export function azureOpenAiRefinementModels(env) {
   return modelTiers(env?.AZURE_OPENAI_IMAGE_DEPLOYMENT, AZURE_OPENAI_DEFAULT_IMAGE_MODELS);
 }
 
-function refinementForm(payload, model, imageField) {
+function refinementForm(payload, model, imageField, mode) {
   const form = new FormData();
   form.append("model", model);
   form.append(imageField, new Blob([payload], { type: "image/png" }), "drawing.png");
-  form.append("prompt", REFINE_PROMPT);
+  form.append("prompt", mode === "redraw" ? REDRAW_PROMPT : REFINE_PROMPT);
   // These known GPT Image 2.5 deployments reject the input_fidelity field.
   const rejectsInputFidelity = imageField === "image[]"
     && ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"].includes(model);
-  if (!rejectsInputFidelity) form.append("input_fidelity", "high");
+  if (mode === "refine" && !rejectsInputFidelity) form.append("input_fidelity", "high");
   form.append("quality", "low");
   form.append("size", "1024x1536");
   form.append("output_format", "png");
@@ -467,6 +473,10 @@ async function handleRefinement(request, env) {
   if (!(await deviceAuthorized(request, env))) {
     throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
   }
+  const mode = request.headers.get("X-Refinement-Mode") ?? "refine";
+  if (mode !== "refine" && mode !== "redraw") {
+    throw new HttpError(400, "invalid refinement mode");
+  }
   const maiConfigured = Boolean(env.AZURE_MAI_API_KEY && env.AZURE_MAI_ENDPOINT);
   const azureOpenAiConfigured = Boolean(env.AZURE_OPENAI_API_KEY && env.AZURE_OPENAI_ENDPOINT);
   if (!maiConfigured && !azureOpenAiConfigured) {
@@ -493,8 +503,10 @@ async function handleRefinement(request, env) {
   }
 
   const encodedDeviceId = encodeURIComponent(deviceId);
-  const inputKey = `refinement-inputs/${encodedDeviceId}/${refinementKey}.png`;
-  const cacheKey = `refinements/${encodedDeviceId}/${refinementKey}.png`;
+  const storedRefinementKey = mode === "redraw" ? `redraw:${refinementKey}` : refinementKey;
+  const imageKey = mode === "redraw" ? `redraw-${refinementKey}` : refinementKey;
+  const inputKey = `refinement-inputs/${encodedDeviceId}/${imageKey}.png`;
+  const cacheKey = `refinements/${encodedDeviceId}/${imageKey}.png`;
   let cached = null;
   let cachedModel = "cached-result";
   if (typeof env.MAILBOX_IMAGES.getWithMetadata === "function") {
@@ -507,10 +519,11 @@ async function handleRefinement(request, env) {
   if (cached) {
     await recordRefinementHistory(env, {
       deviceId,
-      refinementKey,
+      refinementKey: storedRefinementKey,
       inputKey,
       outputKey: cacheKey,
       model: cachedModel,
+      mode,
       input: payload,
       output: cached,
     });
@@ -519,6 +532,7 @@ async function handleRefinement(request, env) {
       headers: responseHeaders("image/png", {
         "X-Refinement-Cache": "hit",
         "X-Refinement-Model": cachedModel,
+        "X-Refinement-Mode": mode,
       }),
     });
   }
@@ -535,7 +549,7 @@ async function handleRefinement(request, env) {
         upstream = await fetch(endpoint, {
           method: "POST",
           headers: { "api-key": env.AZURE_MAI_API_KEY },
-          body: refinementForm(payload, candidate, "image"),
+          body: refinementForm(payload, candidate, "image", mode),
         });
       } catch (error) {
         console.error("image refinement request failed", candidate, error?.message || String(error));
@@ -582,7 +596,7 @@ async function handleRefinement(request, env) {
         upstream = await fetch(endpoint, {
           method: "POST",
           headers: { "api-key": env.AZURE_OPENAI_API_KEY },
-          body: refinementForm(payload, candidate, "image[]"),
+          body: refinementForm(payload, candidate, "image[]", mode),
         });
       } catch (error) {
         console.error("image refinement request failed", candidate, error?.message || String(error));
@@ -620,16 +634,19 @@ async function handleRefinement(request, env) {
   if (refined === null) throw new HttpError(502, "image refinement failed");
   await recordRefinementHistory(env, {
     deviceId,
-    refinementKey,
+    refinementKey: storedRefinementKey,
     inputKey,
     outputKey: cacheKey,
     model,
+    mode,
     input: payload,
     output: refined,
   });
   return new Response(refined, {
     status: 200,
-    headers: responseHeaders("image/png", { "X-Refinement-Cache": "miss", "X-Refinement-Model": model }),
+    headers: responseHeaders("image/png", {
+      "X-Refinement-Cache": "miss", "X-Refinement-Model": model, "X-Refinement-Mode": mode,
+    }),
   });
 }
 
@@ -665,7 +682,7 @@ async function handleDeviceHistory(request, env, url) {
         CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS has_reply, '' AS model
       FROM messages AS m LEFT JOIN replies AS r ON r.message_id = m.id
       UNION ALL
-      SELECT 'refinement' AS kind, id, created_at,
+      SELECT CASE WHEN mode = 'redraw' THEN 'redraw' ELSE 'refinement' END AS kind, id, created_at,
         CASE WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'
           THEN created_at ELSE '0000-00-00T00:00:00Z' END AS sort_time,
         1 AS kind_rank, input_available, 0 AS has_reply, model
@@ -812,7 +829,7 @@ async function handleReply(request, env, messageId) {
 async function handleRefinementHistory(request, env) {
   if (!(await familyAuthorized(request, env))) throw new HttpError(403, "forbidden");
   const query = await env.MAILBOX_DB.prepare(
-    `SELECT id, device_id, model, created_at, input_available
+    `SELECT id, device_id, model, mode, created_at, input_available
      FROM refinements
      ORDER BY id DESC`,
   ).all();
@@ -843,6 +860,7 @@ export function renderRefinementHistory(refinements) {
     const id = Number(item.id);
     const device = escapeHtml(item.device_id);
     const model = escapeHtml(item.model);
+    const mode = item.mode === "redraw" ? "AI 大幅重画" : "AI 润色";
     const legacy = Number(item.input_available) === 0;
     const created = legacy ? "旧版记录" : escapeHtml(item.created_at);
     const input = legacy
@@ -854,7 +872,7 @@ export function renderRefinementHistory(refinements) {
         ${input}
         <figure><figcaption>AI 生成的图片</figcaption><img src="/refinements/${id}/output.png" alt="第 ${id} 次 AI 创作的结果图" loading="lazy"></figure>
       </div>
-      <div class="model">模型：${model}</div>
+      <div class="model">模式：${mode} · 模型：${model}</div>
     </article>`;
   });
   if (cards.length === 0) cards.push('<p class="empty">还没有 AI 创作记录。</p>');
