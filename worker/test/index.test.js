@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import worker, {
+  azureOpenAiRefinementModels,
   escapeHtml,
   parseContentLength,
   refinementModels,
@@ -140,6 +141,31 @@ function memoryKv() {
       values.delete(key);
       metadata.delete(key);
     },
+  };
+}
+
+function refinementRequest(input) {
+  return new Request("https://example.test/api/device/refinements", {
+    method: "POST",
+    headers: {
+      Authorization: "Bearer device-secret",
+      "Content-Type": "image/png",
+      "Content-Length": String(input.byteLength),
+      "X-Device-Id": "ian-kobo",
+      "X-Refinement-Key": "1234567890abcdef",
+    },
+    body: input,
+  });
+}
+
+function openAiRefinementEnv(overrides = {}) {
+  return {
+    ...env,
+    AZURE_OPENAI_API_KEY: "azure-openai-test-secret",
+    AZURE_OPENAI_ENDPOINT: "https://openai-test.openai.azure.com/",
+    MAILBOX_DB: memoryRefinementDb(),
+    MAILBOX_IMAGES: memoryKv(),
+    ...overrides,
   };
 }
 
@@ -303,7 +329,7 @@ test("family can browse protected refinement history and both images", async () 
   }
 });
 
-test("device can refine a PNG through MAI-Image-2.5-Pro and retries use the KV cache", async () => {
+test("device can refine a PNG through MAI-Image-2.6 and retries use the KV cache", async () => {
   const input = makePng();
   const refined = makePng([chunk("tEXt", new TextEncoder().encode("refined"))]);
   const images = memoryKv();
@@ -320,7 +346,7 @@ test("device can refine a PNG through MAI-Image-2.5-Pro and retries use the KV c
     assert.equal(url, "https://mai-test.services.ai.azure.com/mai/v1/images/edits");
     assert.equal(options.method, "POST");
     assert.equal(options.headers["api-key"], "azure-mai-test-secret");
-    assert.equal(options.body.get("model"), "MAI-Image-2.5-Pro");
+    assert.equal(options.body.get("model"), "MAI-Image-2.6");
     assert.equal(options.body.get("input_fidelity"), "high");
     assert.equal(options.body.get("quality"), "low");
     assert.equal(options.body.get("size"), "1024x1536");
@@ -353,20 +379,20 @@ test("device can refine a PNG through MAI-Image-2.5-Pro and retries use the KV c
     assert.equal(first.status, 200);
     assert.equal(first.headers.get("Content-Type"), "image/png");
     assert.equal(first.headers.get("X-Refinement-Cache"), "miss");
-    assert.equal(first.headers.get("X-Refinement-Model"), "MAI-Image-2.5-Pro");
+    assert.equal(first.headers.get("X-Refinement-Model"), "MAI-Image-2.6");
     assert.deepEqual(new Uint8Array(await first.arrayBuffer()), refined);
 
     const second = await worker.fetch(request(), refineEnv);
     assert.equal(second.status, 200);
     assert.equal(second.headers.get("X-Refinement-Cache"), "hit");
-    assert.equal(second.headers.get("X-Refinement-Model"), "MAI-Image-2.5-Pro");
+    assert.equal(second.headers.get("X-Refinement-Model"), "MAI-Image-2.6");
     assert.deepEqual(new Uint8Array(await second.arrayBuffer()), refined);
     assert.equal(openAiCalls, 1);
     assert.deepEqual(images.values.get("refinement-inputs/ian-kobo/0123456789abcdef.png"), input);
     assert.deepEqual(images.values.get("refinements/ian-kobo/0123456789abcdef.png"), refined);
     const history = refineEnv.MAILBOX_DB.rows.find((row) => row.refinement_key === "0123456789abcdef");
     assert.equal(history.device_id, "ian-kobo");
-    assert.equal(history.model, "MAI-Image-2.5-Pro");
+    assert.equal(history.model, "MAI-Image-2.6");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -447,14 +473,20 @@ test("refinement falls back down the model tiers when capacity is exhausted", as
     }), refineEnv);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("X-Refinement-Model"), "MAI-Image-2.5-Flash");
-    assert.deepEqual(attempted, ["MAI-Image-2.5-Pro", "MAI-Image-2.5", "MAI-Image-2.5-Flash"]);
+    assert.deepEqual(attempted, [
+      "MAI-Image-2.6",
+      "MAI-Image-2.6-Flash",
+      "MAI-Image-2.5-Pro",
+      "MAI-Image-2.5",
+      "MAI-Image-2.5-Flash",
+    ]);
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), refined);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("refinement falls back to Azure gpt-image-2 after every MAI tier is exhausted", async () => {
+test("refinement reaches legacy gpt-image-2 after every newer tier is exhausted", async () => {
   const input = makePng();
   const refined = makePng([chunk("tEXt", new TextEncoder().encode("gpt-image-2"))]);
   const images = memoryKv();
@@ -481,9 +513,16 @@ test("refinement falls back to Azure gpt-image-2 after every MAI tier is exhaust
     assert.equal(url, "https://openai-test.openai.azure.com/openai/v1/images/edits");
     assert.equal(options.headers["api-key"], "azure-openai-test-secret");
     assert.equal(options.body.get("image"), null);
+    assert.equal(options.body.get("input_fidelity"), model === "gpt-image-2" ? "high" : null);
+    assert.equal(options.body.get("quality"), "low");
+    assert.equal(options.body.get("size"), "1024x1536");
+    assert.equal(options.body.get("output_format"), "png");
+    assert.equal(options.body.get("moderation"), "auto");
+    assert.equal(options.body.get("n"), "1");
     const image = options.body.get("image[]");
     assert.equal(image.type, "image/png");
     assert.deepEqual(new Uint8Array(await image.arrayBuffer()), input);
+    if (model !== "gpt-image-2") return new Response("rate limited", { status: 429 });
     return Response.json({ data: [{ b64_json: Buffer.from(refined).toString("base64") }] });
   };
   try {
@@ -501,9 +540,13 @@ test("refinement falls back to Azure gpt-image-2 after every MAI tier is exhaust
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("X-Refinement-Model"), "gpt-image-2");
     assert.deepEqual(attempted, [
+      "MAI-Image-2.6",
+      "MAI-Image-2.6-Flash",
       "MAI-Image-2.5-Pro",
       "MAI-Image-2.5",
       "MAI-Image-2.5-Flash",
+      "gpt-image-2.5-sunburst",
+      "gpt-image-2.5-flare",
       "gpt-image-2",
     ]);
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), refined);
@@ -512,7 +555,7 @@ test("refinement falls back to Azure gpt-image-2 after every MAI tier is exhaust
   }
 });
 
-test("a non-moderation MAI 400 skips directly to Azure gpt-image-2", async () => {
+test("a non-moderation MAI 400 skips directly to Azure sunburst", async () => {
   const input = makePng();
   const refined = makePng([chunk("tEXt", new TextEncoder().encode("gpt-image-2-after-400"))]);
   const images = memoryKv();
@@ -548,8 +591,8 @@ test("a non-moderation MAI 400 skips directly to Azure gpt-image-2", async () =>
       body: input,
     }), refineEnv);
     assert.equal(response.status, 200);
-    assert.equal(response.headers.get("X-Refinement-Model"), "gpt-image-2");
-    assert.deepEqual(attempted, ["MAI-Image-2.5-Pro", "gpt-image-2"]);
+    assert.equal(response.headers.get("X-Refinement-Model"), "gpt-image-2.5-sunburst");
+    assert.deepEqual(attempted, ["MAI-Image-2.6", "gpt-image-2.5-sunburst"]);
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), refined);
   } finally {
     globalThis.fetch = originalFetch;
@@ -600,7 +643,13 @@ test("a moderation 400 from the first tier does not cross providers", async () =
 test("AZURE_MAI_MODEL overrides the default tier order", () => {
   assert.deepEqual(
     refinementModels({}),
-    ["MAI-Image-2.5-Pro", "MAI-Image-2.5", "MAI-Image-2.5-Flash"],
+    [
+      "MAI-Image-2.6",
+      "MAI-Image-2.6-Flash",
+      "MAI-Image-2.5-Pro",
+      "MAI-Image-2.5",
+      "MAI-Image-2.5-Flash",
+    ],
   );
   assert.deepEqual(
     refinementModels({ AZURE_MAI_MODEL: " MAI-Image-2.5 , MAI-Image-2.5-Flash " }),
@@ -608,6 +657,240 @@ test("AZURE_MAI_MODEL overrides the default tier order", () => {
   );
   assert.deepEqual(
     refinementModels({ AZURE_MAI_MODEL: "  " }),
-    ["MAI-Image-2.5-Pro", "MAI-Image-2.5", "MAI-Image-2.5-Flash"],
+    [
+      "MAI-Image-2.6",
+      "MAI-Image-2.6-Flash",
+      "MAI-Image-2.5-Pro",
+      "MAI-Image-2.5",
+      "MAI-Image-2.5-Flash",
+    ],
   );
+});
+
+test("AZURE_OPENAI_IMAGE_DEPLOYMENT accepts a single deployment or an ordered list", () => {
+  const defaults = ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-image-2"];
+  assert.deepEqual(azureOpenAiRefinementModels({}), defaults);
+  assert.deepEqual(azureOpenAiRefinementModels({ AZURE_OPENAI_IMAGE_DEPLOYMENT: "  " }), defaults);
+  assert.deepEqual(
+    azureOpenAiRefinementModels({ AZURE_OPENAI_IMAGE_DEPLOYMENT: " gpt-image-2 " }),
+    ["gpt-image-2"],
+  );
+  assert.deepEqual(
+    azureOpenAiRefinementModels({
+      AZURE_OPENAI_IMAGE_DEPLOYMENT: " gpt-image-2.5-flare , , gpt-image-2 ",
+    }),
+    ["gpt-image-2.5-flare", "gpt-image-2"],
+  );
+  assert.deepEqual(
+    azureOpenAiRefinementModels({ AZURE_OPENAI_IMAGE_DEPLOYMENT: `bad\rname,${"x".repeat(101)}` }),
+    defaults,
+  );
+});
+
+test("Azure OpenAI advances past deployment failures and caches only the successful model", async (t) => {
+  const failures = [
+    ["success", null],
+    ["network failure", () => { throw new Error("connection reset"); }],
+    ["invalid JSON", () => new Response("{")],
+    ["missing image", () => Response.json({ data: [] })],
+    ["invalid base64", () => Response.json({ data: [{ b64_json: "!" }] })],
+    ["invalid PNG", () => Response.json({ data: [{ b64_json: "aW52YWxpZA==" }] })],
+    ...[400, 404, 408, 409, 422, 429, 500, 503].map((status) => [
+      `HTTP ${status}`,
+      () => Response.json({ error: { code: "deployment_unavailable" } }, { status }),
+    ]),
+  ];
+  for (const [name, fail] of failures) {
+    await t.test(name, async () => {
+      const input = makePng();
+      const refined = makePng([chunk("tEXt", new TextEncoder().encode(name))]);
+      const refineEnv = openAiRefinementEnv();
+      const attempts = [];
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (url, options) => {
+        attempts.push({ url, options });
+        if (attempts.length === 1 && fail) return fail();
+        return Response.json({ data: [{ b64_json: Buffer.from(refined).toString("base64") }] });
+      };
+      try {
+        const successfulModel = fail ? "gpt-image-2.5-flare" : "gpt-image-2.5-sunburst";
+        const expectedModels = fail
+          ? ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare"]
+          : ["gpt-image-2.5-sunburst"];
+        const first = await worker.fetch(refinementRequest(input), refineEnv);
+        assert.equal(first.status, 200);
+        assert.equal(first.headers.get("X-Refinement-Model"), successfulModel);
+        assert.equal(first.headers.get("X-Refinement-Cache"), "miss");
+        assert.deepEqual(new Uint8Array(await first.arrayBuffer()), refined);
+        assert.deepEqual(attempts.map(({ options }) => options.body.get("model")), expectedModels);
+        for (const { url, options } of attempts) {
+          assert.equal(url, "https://openai-test.openai.azure.com/openai/v1/images/edits");
+          assert.equal(options.headers["api-key"], "azure-openai-test-secret");
+          assert.equal(options.body.get("image"), null);
+          assert.deepEqual(new Uint8Array(await options.body.get("image[]").arrayBuffer()), input);
+          assert.equal(options.body.has("input_fidelity"), false);
+          assert.equal(options.body.get("quality"), "low");
+          assert.equal(options.body.get("size"), "1024x1536");
+          assert.equal(options.body.get("output_format"), "png");
+          assert.equal(options.body.get("moderation"), "auto");
+          assert.equal(options.body.get("n"), "1");
+        }
+        const cacheKey = "refinements/ian-kobo/1234567890abcdef.png";
+        assert.equal(refineEnv.MAILBOX_IMAGES.metadata.get(cacheKey).model, successfulModel);
+        assert.equal(refineEnv.MAILBOX_DB.rows.length, 1);
+        assert.equal(refineEnv.MAILBOX_DB.rows[0].model, successfulModel);
+
+        const cached = await worker.fetch(refinementRequest(input), refineEnv);
+        assert.equal(cached.headers.get("X-Refinement-Cache"), "hit");
+        assert.equal(cached.headers.get("X-Refinement-Model"), successfulModel);
+        assert.deepEqual(new Uint8Array(await cached.arrayBuffer()), refined);
+        assert.equal(attempts.length, expectedModels.length);
+        assert.equal(refineEnv.MAILBOX_DB.rows.length, 1);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  }
+});
+
+test("Azure OpenAI stops on moderation, shared authentication, and permanent request failures", async (t) => {
+  const failures = [
+    ["moderation", 400, { error: { code: "content_policy_violation" } }],
+    ["header moderation", 429, {}, { "x-ms-error-code": "content_filter" }],
+    ["unauthorized", 401, { error: { code: "invalid_api_key" } }],
+    ["forbidden", 403, { error: { code: "permission_denied" } }],
+    ["oversized request", 413, { error: { code: "request_too_large" } }],
+  ];
+  for (const [name, status, body, headers] of failures) {
+    await t.test(name, async () => {
+      const refineEnv = openAiRefinementEnv();
+      let calls = 0;
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
+        calls += 1;
+        return Response.json(body, { status, headers });
+      };
+      try {
+        const response = await worker.fetch(refinementRequest(makePng()), refineEnv);
+        assert.equal(response.status, 502);
+        assert.equal(await response.text(), "image refinement failed\n");
+        assert.equal(calls, 1);
+        assert.equal(refineEnv.MAILBOX_IMAGES.values.size, 0);
+        assert.equal(refineEnv.MAILBOX_DB.rows.length, 0);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  }
+});
+
+test("Azure OpenAI exhausts only the configured deployments without caching a failure", async (t) => {
+  const configurations = [
+    ["defaults", {}, ["gpt-image-2.5-sunburst", "gpt-image-2.5-flare", "gpt-image-2"]],
+    ["single override", { AZURE_OPENAI_IMAGE_DEPLOYMENT: "gpt-image-2" }, ["gpt-image-2"]],
+    [
+      "ordered override",
+      { AZURE_OPENAI_IMAGE_DEPLOYMENT: " gpt-image-2.5-flare , gpt-image-2 " },
+      ["gpt-image-2.5-flare", "gpt-image-2"],
+    ],
+  ];
+  for (const [name, overrides, expectedModels] of configurations) {
+    await t.test(name, async () => {
+      const refineEnv = openAiRefinementEnv(overrides);
+      const attempted = [];
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (_url, options) => {
+        attempted.push(options.body.get("model"));
+        return new Response("upstream detail must stay private", { status: 503 });
+      };
+      try {
+        const response = await worker.fetch(refinementRequest(makePng()), refineEnv);
+        assert.equal(response.status, 502);
+        assert.equal(await response.text(), "image refinement failed\n");
+        assert.deepEqual(attempted, expectedModels);
+        assert.equal(refineEnv.MAILBOX_IMAGES.values.size, 0);
+        assert.equal(refineEnv.MAILBOX_DB.rows.length, 0);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  }
+});
+
+test("existing legacy-model cache entries remain usable after the model upgrade", async () => {
+  const input = makePng();
+  const cachedImage = makePng([chunk("tEXt", new TextEncoder().encode("legacy output"))]);
+  const refineEnv = openAiRefinementEnv();
+  await refineEnv.MAILBOX_IMAGES.put("refinements/ian-kobo/1234567890abcdef.png", cachedImage, {
+    metadata: { contentType: "image/png", role: "output", model: "gpt-image-2" },
+  });
+  let calls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    calls += 1;
+    throw new Error("cached output must not invoke an upstream");
+  };
+  try {
+    const response = await worker.fetch(refinementRequest(input), refineEnv);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("X-Refinement-Cache"), "hit");
+    assert.equal(response.headers.get("X-Refinement-Model"), "gpt-image-2");
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), cachedImage);
+    assert.equal(calls, 0);
+    assert.equal(refineEnv.MAILBOX_DB.rows[0].model, "gpt-image-2");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("input fidelity is omitted only for the two known GPT Image 2.5 deployments", async (t) => {
+  const deployments = [
+    ["mai", "MAI-Image-2.6", "high"],
+    ["mai", "MAI-Image-2.6-Flash", "high"],
+    ["mai", "MAI-Image-2.5-Pro", "high"],
+    ["mai", "MAI-Image-2.5", "high"],
+    ["mai", "MAI-Image-2.5-Flash", "high"],
+    ["openai", "gpt-image-2.5-sunburst", null],
+    ["openai", "gpt-image-2.5-flare", null],
+    ["openai", "gpt-image-2", "high"],
+    ["openai", "custom-image-deployment", "high"],
+    ["openai", "my-gpt-image-2.5-sunburst", "high"],
+  ];
+  for (const [provider, model, inputFidelity] of deployments) {
+    await t.test(model, async () => {
+      const input = makePng();
+      const refineEnv = provider === "mai"
+        ? {
+          ...env,
+          AZURE_MAI_API_KEY: "azure-mai-test-secret",
+          AZURE_MAI_ENDPOINT: "https://mai-test.services.ai.azure.com",
+          AZURE_MAI_MODEL: model,
+          MAILBOX_DB: memoryRefinementDb(),
+          MAILBOX_IMAGES: memoryKv(),
+        }
+        : openAiRefinementEnv({ AZURE_OPENAI_IMAGE_DEPLOYMENT: model });
+      let submitted;
+      const originalFetch = globalThis.fetch;
+      globalThis.fetch = async (_url, options) => {
+        submitted = options.body;
+        return Response.json({ data: [{ b64_json: Buffer.from(input).toString("base64") }] });
+      };
+      try {
+        const response = await worker.fetch(refinementRequest(input), refineEnv);
+        assert.equal(response.status, 200);
+        assert.equal(submitted.get("model"), model);
+        assert.equal(submitted.get("input_fidelity"), inputFidelity);
+        assert.equal(submitted.has("input_fidelity"), inputFidelity !== null);
+        assert.equal(submitted.get("quality"), "low");
+        assert.equal(submitted.get("size"), "1024x1536");
+        assert.equal(submitted.get("output_format"), "png");
+        assert.equal(submitted.get("moderation"), "auto");
+        assert.equal(submitted.get("n"), "1");
+        const imageField = provider === "mai" ? "image" : "image[]";
+        assert.deepEqual(new Uint8Array(await submitted.get(imageField).arrayBuffer()), input);
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  }
 });

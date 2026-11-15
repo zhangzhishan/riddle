@@ -8,27 +8,40 @@ This directory contains the production HTTPS implementation of Ian's Paper Plane
 - D1 (`MAILBOX_DB`): message/reply metadata, AI refinement history, and ordered integer IDs.
 - Workers KV (`MAILBOX_IMAGES`): mailbox PNGs plus each AI input/output pair.
 - Custom domain: `https://ian-mailbox.code4fun.me`.
-- Secrets: `MAILBOX_DEVICE_TOKEN`, `MAILBOX_FAMILY_TOKEN`, `AZURE_MAI_API_KEY`, `AZURE_MAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and `AZURE_OPENAI_ENDPOINT`, stored with Wrangler and never committed. `AZURE_MAI_MODEL` is optional: a comma-separated tier list that overrides the default `MAI-Image-2.5-Pro,MAI-Image-2.5,MAI-Image-2.5-Flash`. `AZURE_OPENAI_IMAGE_DEPLOYMENT` optionally overrides the final fallback deployment, which defaults to `gpt-image-2`.
+- Secrets: `MAILBOX_DEVICE_TOKEN`, `MAILBOX_FAMILY_TOKEN`, `AZURE_MAI_API_KEY`, `AZURE_MAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, and `AZURE_OPENAI_ENDPOINT`, stored with Wrangler and never committed. `AZURE_MAI_MODEL` is optional: a comma-separated tier list that overrides the default `MAI-Image-2.6,MAI-Image-2.6-Flash,MAI-Image-2.5-Pro,MAI-Image-2.5,MAI-Image-2.5-Flash`. `AZURE_OPENAI_IMAGE_DEPLOYMENT` accepts a single deployment or a comma-separated fallback list, defaulting to `gpt-image-2.5-sunburst,gpt-image-2.5-flare,gpt-image-2`.
 
 The Kobo can deliberately request **AI 润色** after drawing. If the input is mainly handwriting, including Chinese, the fixed prompt tells the model to treat those words as the scene request and generate the described picture instead of simply reproducing the text. The Worker keeps Azure credentials off the device and returns a PNG that the Kobo scales to its grayscale canvas. After generation, Ian can either return to the original or adopt the AI result as a new background and continue drawing on top; later send/refine actions export the full composited canvas. A deterministic `X-Refinement-Key` caches successful results in KV, so retrying the same drawing normally does not create another paid image request.
 
 Every successful AI request stores its submitted PNG and generated PNG as a pair. Family members who already hold the private family cookie can open `/refinements` to browse the newest pairs first; both image routes remain capability-protected and non-cacheable.
 
 MAI preview quota may be unavailable or heavily constrained, so refinement
-walks a quality-ordered tier list and steps down on network failures,
-`429`, or `5xx`:
-`MAI-Image-2.5-Pro` → `MAI-Image-2.5` → `MAI-Image-2.5-Flash` → Azure OpenAI `gpt-image-2`.
+tries the new MAI deployments first and keeps the previous models as fallbacks:
+`MAI-Image-2.6` → `MAI-Image-2.6-Flash` → `MAI-Image-2.5-Pro` →
+`MAI-Image-2.5` → `MAI-Image-2.5-Flash` → Azure OpenAI
+`gpt-image-2.5-sunburst` → `gpt-image-2.5-flare` → `gpt-image-2`.
+MAI advances on network failures, invalid responses, `429`, or `5xx`.
 Explicit content-moderation rejections stop immediately instead of trying
-another provider. Other MAI client errors skip the remaining MAI tiers and go
-directly to the separately configured Azure OpenAI fallback. The model that
-produced the image is reported in the `X-Refinement-Model` response header and
-stored in KV entry metadata.
+another model or provider. Other MAI client errors skip the remaining MAI tiers
+and go directly to the separately configured Azure OpenAI fallback. Azure
+OpenAI advances on network failures, invalid responses, `400`, `404`, `408`,
+`409`, `422`, `429`, or `5xx`; this permits an older deployment to serve the
+request when a preview deployment is unavailable or rejects a parameter.
+Authentication errors (`401`/`403`) and other permanent client errors stop the
+request. The successful model is reported in the `X-Refinement-Model` response
+header and stored in KV entry metadata and refinement history.
 
 The MAI path is `${AZURE_MAI_ENDPOINT}/mai/v1/images/edits` with an `api-key`
 header and an `image` form field. The Azure OpenAI fallback uses
 `${AZURE_OPENAI_ENDPOINT}/openai/v1/images/edits`, the separate Azure OpenAI
 key, and an `image[]` form field. MAI models are **not** reachable through the
 `/openai/...` routes.
+
+The known Azure OpenAI deployment names `gpt-image-2.5-sunburst` and
+`gpt-image-2.5-flare` reject `input_fidelity`, so the Worker omits that field
+only for those two names. MAI, legacy `gpt-image-2`, and custom deployment names
+keep `input_fidelity=high`. All deployments retain `quality=low`,
+`size=1024x1536`, and PNG output. A custom alias for either GPT Image 2.5 model
+requires an explicit compatibility update before use.
 
 The Python service under `server/` remains useful for local/LAN deployment and the original mailbox protocol tests. Upload, reply, family, and health routes stay compatible between both implementations; AI refinement is provided by the production Worker because that is where the Azure secret and result cache live.
 
