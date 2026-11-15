@@ -633,6 +633,80 @@ async function handleRefinement(request, env) {
   });
 }
 
+async function handleDeviceHistory(request, env, url) {
+  if (!(await deviceAuthorized(request, env))) {
+    throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
+  }
+  const entries = exactEntries(url.searchParams);
+  if (entries.some(([key]) => !["limit", "cursor"].includes(key)) ||
+      new Set(entries.map(([key]) => key)).size !== entries.length) {
+    throw new HttpError(400, "invalid history parameters");
+  }
+  const limitText = url.searchParams.get("limit") ?? "20";
+  const limit = Number(limitText);
+  if (!/^[1-9][0-9]*$/.test(limitText) || limit > 50) {
+    throw new HttpError(400, "invalid history limit");
+  }
+  const cursor = url.searchParams.get("cursor");
+  let bindings = [];
+  if (cursor !== null) {
+    const match = cursor.match(/^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)\|([21])\|([1-9][0-9]*)$/);
+    if (!match || !Number.isSafeInteger(Number(match[3]))) {
+      throw new HttpError(400, "invalid history cursor");
+    }
+    bindings = [match[1], match[1], Number(match[2]), Number(match[2]), Number(match[3])];
+  }
+  const result = await env.MAILBOX_DB.prepare(`
+    SELECT * FROM (
+      SELECT 'message' AS kind, m.id, m.created_at,
+        CASE WHEN m.created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'
+          THEN m.created_at ELSE '0000-00-00T00:00:00Z' END AS sort_time,
+        2 AS kind_rank, 0 AS input_available,
+        CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS has_reply, '' AS model
+      FROM messages AS m LEFT JOIN replies AS r ON r.message_id = m.id
+      UNION ALL
+      SELECT 'refinement' AS kind, id, created_at,
+        CASE WHEN created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'
+          THEN created_at ELSE '0000-00-00T00:00:00Z' END AS sort_time,
+        1 AS kind_rank, input_available, 0 AS has_reply, model
+      FROM refinements
+    )
+    ${cursor === null ? "" : "WHERE (sort_time < ? OR (sort_time = ? AND (kind_rank < ? OR (kind_rank = ? AND id < ?))))"}
+    ORDER BY sort_time DESC, kind_rank DESC, id DESC LIMIT ?
+  `).bind(...bindings, limit + 1).all();
+  const rows = result.results || [];
+  const items = rows.slice(0, limit);
+  const headers = {};
+  if (rows.length > limit) {
+    const last = items.at(-1);
+    headers["X-Next-Cursor"] = `${last.sort_time}|${last.kind_rank}|${last.id}`;
+  }
+  const clean = (value) => String(value ?? "").replace(/[\t\r\n]/g, "");
+  const body = items.map((row) => [row.kind, row.id, row.created_at,
+    Number(row.input_available) === 1 ? 1 : 0, Number(row.has_reply) === 1 ? 1 : 0, row.model]
+    .map(clean).join("\t") + "\n").join("");
+  return new Response(body, { status: 200,
+    headers: responseHeaders("text/tab-separated-values; charset=utf-8", headers) });
+}
+
+async function handleDeviceHistoryImage(request, env, url, kind, id, side) {
+  if (!(await deviceAuthorized(request, env))) {
+    throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
+  }
+  if (url.search !== "" || !Number.isSafeInteger(Number(id))) throw new HttpError(404, "not found");
+  const row = await env.MAILBOX_DB.prepare(kind === "messages"
+    ? "SELECT image_key FROM messages WHERE id = ?"
+    : "SELECT input_key, output_key, input_available FROM refinements WHERE id = ?")
+    .bind(Number(id)).first();
+  if (!row || (side === "input" && Number(row.input_available) === 0)) {
+    throw new HttpError(404, "not found");
+  }
+  const key = kind === "messages" ? row.image_key : row[`${side}_key`];
+  const image = await env.MAILBOX_IMAGES.get(key, "arrayBuffer");
+  if (!image) throw new HttpError(404, "not found");
+  return new Response(image, { status: 200, headers: responseHeaders("image/png") });
+}
+
 async function handlePoll(request, env, url) {
   if (!(await deviceAuthorized(request, env))) {
     throw new HttpError(401, "unauthorized", { "WWW-Authenticate": 'Bearer realm="paper-plane-device"' });
@@ -865,6 +939,15 @@ async function handleRequest(request, env) {
   if (request.method === "GET" && url.pathname === "/api/device/replies") {
     return handlePoll(request, env, url);
   }
+  if (request.method === "GET" && url.pathname === "/api/device/history") {
+    return handleDeviceHistory(request, env, url);
+  }
+  const historyMessage = url.pathname.match(/^\/api\/device\/history\/(messages)\/([1-9][0-9]*)\.png$/);
+  const historyRefinement = url.pathname.match(/^\/api\/device\/history\/(refinements)\/([1-9][0-9]*)\/(input|output)\.png$/);
+  const historyImage = historyMessage || historyRefinement;
+  if (request.method === "GET" && historyImage) {
+    return handleDeviceHistoryImage(request, env, url, historyImage[1], historyImage[2], historyImage[3]);
+  }
   if (request.method === "GET" && url.pathname === "/") {
     return handleFamilyIndex(request, env, url);
   }
@@ -896,7 +979,7 @@ export default {
     } catch (error) {
       if (error instanceof HttpError) return plain(error.status, error.message, error.headers);
       const url = new URL(request.url);
-      console.error("mailbox request failed", request.method, url.pathname, error?.message || String(error));
+      console.error("mailbox request failed", request.method, url.pathname);
       return plain(500, "internal server error");
     }
   },

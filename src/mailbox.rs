@@ -5,6 +5,7 @@
 //! which keeps accidental sends and error recovery host-testable.
 
 use crate::fb::{SCREEN_H, SCREEN_W};
+use crate::mailbox_client::{HistoryEntry, HistoryImageSide, HistoryKind, HistoryPage};
 
 pub const ACTION_BAR_H: i32 = 180;
 const AUTO_POLL_MS: u64 = 60_000;
@@ -15,6 +16,16 @@ pub enum Retry {
     Upload,
     Poll,
     Refine,
+    History,
+    HistoryItem,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryView {
+    pub items: Vec<HistoryEntry>,
+    pub next_cursor: Option<String>,
+    pub index: usize,
+    pub side: HistoryImageSide,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +39,10 @@ pub enum Screen {
     CheckingInbox,
     Reply { id: u64, body: String },
     Refined,
+    LoadingHistory,
+    HistoryEmpty,
+    History(HistoryView),
+    ConfirmAdoptHistory,
     Error { message: String, retry: Retry },
 }
 
@@ -42,6 +57,12 @@ pub enum Action {
     DismissReply,
     DismissRefinement,
     AdoptRefinement,
+    OpenHistory,
+    LoadHistory,
+    LoadHistoryItem,
+    RenderHistory,
+    CloseHistory,
+    AdoptHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +70,7 @@ pub enum ComposeTarget {
     Canvas,
     Send,
     Refine,
+    History,
     Inbox,
     Clear,
     Outside,
@@ -59,6 +81,11 @@ pub struct MailboxState {
     pub has_ink: bool,
     pub last_reply_id: u64,
     last_poll_ms: u64,
+    history_pending: Option<HistoryView>,
+    history_shown: Option<HistoryView>,
+    history_cursor: Option<String>,
+    history_loading_page: bool,
+    history_original_ink: bool,
 }
 
 impl MailboxState {
@@ -68,6 +95,11 @@ impl MailboxState {
             has_ink: false,
             last_reply_id,
             last_poll_ms: now_ms,
+            history_pending: None,
+            history_shown: None,
+            history_cursor: None,
+            history_loading_page: false,
+            history_original_ink: false,
         }
     }
 
@@ -79,12 +111,14 @@ impl MailboxState {
         if y < bar_y {
             return ComposeTarget::Canvas;
         }
-        let quarter = SCREEN_W as i32 / 4;
-        if x < quarter {
+        let column = SCREEN_W as i32 / 5;
+        if x < column {
             ComposeTarget::Send
-        } else if x < quarter * 2 {
+        } else if x < column * 2 {
             ComposeTarget::Refine
-        } else if x < quarter * 3 {
+        } else if x < column * 3 {
+            ComposeTarget::History
+        } else if x < column * 4 {
             ComposeTarget::Inbox
         } else {
             ComposeTarget::Clear
@@ -108,6 +142,15 @@ impl MailboxState {
                 ComposeTarget::Refine if self.has_ink => {
                     self.screen = Screen::ConfirmRefine;
                     Action::None
+                }
+                ComposeTarget::History => {
+                    self.history_original_ink = self.has_ink;
+                    self.history_pending = None;
+                    self.history_shown = None;
+                    self.history_cursor = None;
+                    self.history_loading_page = true;
+                    self.screen = Screen::LoadingHistory;
+                    Action::OpenHistory
                 }
                 ComposeTarget::Inbox => {
                     self.screen = Screen::CheckingInbox;
@@ -163,6 +206,80 @@ impl MailboxState {
                     Action::DismissRefinement
                 }
             }
+            Screen::HistoryEmpty => {
+                self.screen = Screen::Compose;
+                Action::CloseHistory
+            }
+            Screen::History(view) => {
+                if x < 0
+                    || x >= SCREEN_W as i32
+                    || y < SCREEN_H as i32 - ACTION_BAR_H
+                    || y >= SCREEN_H as i32
+                {
+                    return Action::None;
+                }
+                let mut view = view.clone();
+                match (x / (SCREEN_W as i32 / 5)).min(4) {
+                    0 if view.index > 0 => {
+                        view.index -= 1;
+                        view.side = HistoryImageSide::Output;
+                    }
+                    1 if view.index + 1 < view.items.len() => {
+                        view.index += 1;
+                        view.side = HistoryImageSide::Output;
+                    }
+                    1 if view.next_cursor.is_some() => {
+                        self.history_cursor = view.next_cursor.clone();
+                        view.index += 1;
+                        view.side = HistoryImageSide::Output;
+                        self.history_pending = Some(view);
+                        self.history_loading_page = true;
+                        self.screen = Screen::LoadingHistory;
+                        return Action::LoadHistory;
+                    }
+                    2 if view.items[view.index].kind == HistoryKind::Refinement
+                        && view.items[view.index].input_available =>
+                    {
+                        view.side = match view.side {
+                            HistoryImageSide::Output => HistoryImageSide::Input,
+                            HistoryImageSide::Input => HistoryImageSide::Output,
+                        };
+                    }
+                    3 => {
+                        if self.has_ink {
+                            self.screen = Screen::ConfirmAdoptHistory;
+                            return Action::None;
+                        }
+                        self.has_ink = true;
+                        self.screen = Screen::Compose;
+                        return Action::AdoptHistory;
+                    }
+                    4 => {
+                        self.screen = Screen::Compose;
+                        return Action::CloseHistory;
+                    }
+                    _ => return Action::None,
+                }
+                self.history_pending = Some(view);
+                self.history_loading_page = false;
+                self.screen = Screen::LoadingHistory;
+                Action::LoadHistoryItem
+            }
+            Screen::ConfirmAdoptHistory => {
+                if confirm_target(x, y) {
+                    self.has_ink = true;
+                    self.screen = Screen::Compose;
+                    Action::AdoptHistory
+                } else {
+                    if let Some(view) = &self.history_shown {
+                        self.screen = Screen::History(view.clone());
+                        Action::None
+                    } else {
+                        self.screen = Screen::Compose;
+                        Action::CloseHistory
+                    }
+                }
+            }
             Screen::Error { retry, .. } => {
                 let retry = *retry;
                 if confirm_target(x, y) {
@@ -182,13 +299,31 @@ impl MailboxState {
                             self.screen = Screen::Refining;
                             Action::Refine
                         }
+                        Retry::History | Retry::HistoryItem => {
+                            self.screen = Screen::LoadingHistory;
+                            if self.history_loading_page {
+                                Action::LoadHistory
+                            } else {
+                                Action::LoadHistoryItem
+                            }
+                        }
                     }
                 } else {
+                    if matches!(retry, Retry::History | Retry::HistoryItem) {
+                        if let Some(view) = &self.history_shown {
+                            self.screen = Screen::History(view.clone());
+                            return Action::RenderHistory;
+                        }
+                        self.screen = Screen::Compose;
+                        return Action::CloseHistory;
+                    }
                     self.screen = Screen::Compose;
                     Action::None
                 }
             }
-            Screen::Sending | Screen::Refining | Screen::CheckingInbox => Action::None,
+            Screen::Sending | Screen::Refining | Screen::CheckingInbox | Screen::LoadingHistory => {
+                Action::None
+            }
         }
     }
 
@@ -261,6 +396,156 @@ impl MailboxState {
         }
         Action::None
     }
+
+    pub fn history_page_finished(&mut self, result: Result<HistoryPage, String>) -> Action {
+        if !matches!(self.screen, Screen::LoadingHistory) || !self.history_loading_page {
+            return Action::None;
+        }
+        match result {
+            Err(message) => {
+                self.history_failed(message);
+                Action::None
+            }
+            Ok(page) => {
+                let mut view = self.history_pending.take().unwrap_or(HistoryView {
+                    items: Vec::new(),
+                    next_cursor: None,
+                    index: 0,
+                    side: HistoryImageSide::Output,
+                });
+                view.items.extend(page.items);
+                view.next_cursor = page.next_cursor;
+                self.history_loading_page = false;
+                self.history_cursor = None;
+                if view.items.is_empty() {
+                    self.screen = Screen::HistoryEmpty;
+                    return Action::None;
+                }
+                view.index = view.index.min(view.items.len() - 1);
+                self.history_pending = Some(view);
+                Action::LoadHistoryItem
+            }
+        }
+    }
+
+    pub fn history_image_finished(&mut self, result: Result<(), String>) {
+        if !matches!(self.screen, Screen::LoadingHistory) || self.history_loading_page {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                if let Some(view) = self.history_pending.take() {
+                    self.history_shown = Some(view.clone());
+                    self.screen = Screen::History(view);
+                }
+            }
+            Err(message) => self.history_failed(message),
+        }
+    }
+
+    fn history_failed(&mut self, message: String) {
+        self.screen = Screen::Error {
+            message,
+            retry: if self.history_shown.is_some() {
+                Retry::HistoryItem
+            } else {
+                Retry::History
+            },
+        };
+    }
+}
+
+fn history_summary(view: &HistoryView) -> String {
+    let entry = &view.items[view.index];
+    let date = entry
+        .created_at
+        .get(5..10)
+        .filter(|_| {
+            entry.created_at.as_bytes().get(4) == Some(&b'-')
+                && entry.created_at.as_bytes().get(7) == Some(&b'-')
+        })
+        .unwrap_or("旧版记录");
+    let title = match (entry.kind, view.side) {
+        (HistoryKind::Message, _) => "纸飞机",
+        (HistoryKind::Refinement, HistoryImageSide::Output) => "AI 润色",
+        (HistoryKind::Refinement, HistoryImageSide::Input) => "AI 原图",
+    };
+    let reply = if entry.kind == HistoryKind::Message && entry.has_reply {
+        " • 有回信"
+    } else {
+        ""
+    };
+    format!("{title} • 第 {} 张 • {date}{reply}", view.index + 1)
+}
+
+fn render_refined_png(
+    surf: &mut crate::surface::Surface,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    render_png_region(surf, path, 0)
+}
+
+fn render_png_region(
+    surf: &mut crate::surface::Surface,
+    path: &std::path::Path,
+    header_height: usize,
+) -> std::io::Result<()> {
+    let bytes = std::fs::File::open(path)?;
+    let mut encoded = Vec::new();
+    use std::io::Read;
+    bytes.take(16 * 1024 * 1024 + 1).read_to_end(&mut encoded)?;
+    if encoded.len() > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "history PNG exceeds 16 MiB",
+        ));
+    }
+    let (source_w, source_h, pixels) = decode_png_luma(&encoded)?;
+    let canvas_h = SCREEN_H - ACTION_BAR_H as usize;
+    let area_h = canvas_h - header_height;
+    let max_w = SCREEN_W.saturating_sub(40).max(1);
+    let max_h = area_h.saturating_sub(40).max(1);
+    let (target_w, target_h) = if max_w * source_h <= max_h * source_w {
+        (max_w, (source_h * max_w / source_w).max(1))
+    } else {
+        ((source_w * max_h / source_h).max(1), max_h)
+    };
+    let x0 = (SCREEN_W - target_w) / 2;
+    let y0 = header_height + (area_h - target_h) / 2;
+    surf.fill_rect(0, 0, SCREEN_W, canvas_h, crate::surface::WHITE);
+    for target_y in 0..target_h {
+        let source_y = target_y * source_h / target_h;
+        for target_x in 0..target_w {
+            let value = u16::from(pixels[source_y * source_w + target_x * source_w / target_w]);
+            let color = ((value * 31 / 255) << 11) | ((value * 63 / 255) << 5) | (value * 31 / 255);
+            surf.put_px((x0 + target_x) as i32, (y0 + target_y) as i32, color);
+        }
+    }
+    Ok(())
+}
+
+fn render_history_png(
+    surf: &mut crate::surface::Surface,
+    path: &std::path::Path,
+    view: &HistoryView,
+) -> std::io::Result<()> {
+    render_png_region(surf, path, 84)?;
+    let font =
+        ab_glyph::FontRef::try_from_slice(MAILBOX_FONT_TTF).map_err(std::io::Error::other)?;
+    let line = crate::script::rasterize_line(&font, &history_summary(view), 38.0);
+    let x0 = SCREEN_W.saturating_sub(line.width) / 2;
+    for row in 0..line.height.min(64) {
+        for column in 0..line.width {
+            if line.mask[row * line.width + column] {
+                surf.put_px(
+                    (x0 + column) as i32,
+                    (14 + row) as i32,
+                    crate::surface::BLACK,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn confirm_target(x: i32, y: i32) -> bool {
@@ -398,7 +683,7 @@ fn write_canvas_png(
 pub fn run() -> std::io::Result<()> {
     use crate::fb::BBox;
     use crate::ink::Ink;
-    use crate::mailbox_client::{MailboxClient, Reply as MailReply};
+    use crate::mailbox_client::{HistoryCache, MailboxClient, Reply as MailReply};
     use crate::pen::{PenDevice, Tool, MAX_PRESSURE};
     use crate::surface::{Surface, BLACK, WHITE};
     use ab_glyph::FontRef;
@@ -411,6 +696,8 @@ pub fn run() -> std::io::Result<()> {
         Upload(Result<u64, String>),
         Refine(Result<(), String>),
         Poll(Result<Option<MailReply>, String>),
+        HistoryPage(Result<HistoryPage, String>),
+        HistoryImage(Result<PathBuf, String>),
     }
 
     fn outbox_dir() -> PathBuf {
@@ -457,6 +744,33 @@ pub fn run() -> std::io::Result<()> {
         });
     }
 
+    fn start_history_page(tx: mpsc::Sender<NetResult>, outbox: PathBuf, cursor: Option<String>) {
+        std::thread::spawn(move || {
+            let result = MailboxClient::from_env()
+                .and_then(|client| {
+                    HistoryCache::new(outbox).list_history(&client, cursor.as_deref(), 20)
+                })
+                .map_err(|error| error.to_string());
+            let _ = tx.send(NetResult::HistoryPage(result));
+        });
+    }
+
+    fn start_history_image(
+        tx: mpsc::Sender<NetResult>,
+        outbox: PathBuf,
+        entry: HistoryEntry,
+        side: HistoryImageSide,
+    ) {
+        std::thread::spawn(move || {
+            let result = MailboxClient::from_env()
+                .and_then(|client| {
+                    HistoryCache::new(outbox).fetch_image(&client, entry.kind, entry.id, side)
+                })
+                .map_err(|error| error.to_string());
+            let _ = tx.send(NetResult::HistoryImage(result));
+        });
+    }
+
     fn draw_text(
         surf: &mut Surface,
         font: &FontRef,
@@ -489,14 +803,51 @@ pub fn run() -> std::io::Result<()> {
         surf.fill_rect(0, y, SCREEN_W, 3, BLACK);
         match &state.screen {
             Screen::Compose => {
-                let quarter = SCREEN_W / 4;
-                for divider in 1..4 {
-                    surf.fill_rect(quarter * divider, y, 2, ACTION_BAR_H as usize, BLACK);
+                let column = SCREEN_W / 5;
+                for divider in 1..5 {
+                    surf.fill_rect(column * divider, y, 2, ACTION_BAR_H as usize, BLACK);
                 }
-                draw_text(surf, font, "发送", 48.0, quarter / 2, y + 56);
-                draw_text(surf, font, "AI润色", 48.0, quarter + quarter / 2, y + 56);
-                draw_text(surf, font, "收信", 48.0, quarter * 2 + quarter / 2, y + 56);
-                draw_text(surf, font, "清空", 48.0, quarter * 3 + quarter / 2, y + 56);
+                for (index, label) in ["发送", "AI润色", "历史", "收信", "清空"]
+                    .iter()
+                    .enumerate()
+                {
+                    draw_text(surf, font, label, 44.0, column * index + column / 2, y + 56);
+                }
+            }
+            Screen::LoadingHistory => {
+                draw_text(surf, font, "正在读取历史图画……", 48.0, SCREEN_W / 2, y + 50)
+            }
+            Screen::HistoryEmpty => {
+                surf.fill_rect(0, 0, SCREEN_W, y, WHITE);
+                draw_text(surf, font, "还没有历史图画", 58.0, SCREEN_W / 2, y / 2);
+                draw_text(surf, font, "点一下回到画纸", 48.0, SCREEN_W / 2, y + 50);
+            }
+            Screen::History(view) => {
+                let column = SCREEN_W / 5;
+                let entry = &view.items[view.index];
+                let toggle = if entry.kind == HistoryKind::Refinement && entry.input_available {
+                    if view.side == HistoryImageSide::Output {
+                        "看原图"
+                    } else {
+                        "看AI图"
+                    }
+                } else {
+                    "单张图"
+                };
+                for divider in 1..5 {
+                    surf.fill_rect(column * divider, y, 2, ACTION_BAR_H as usize, BLACK);
+                }
+                for (index, label) in ["上一张", "下一张", toggle, "继续画", "返回"]
+                    .iter()
+                    .enumerate()
+                {
+                    draw_text(surf, font, label, 44.0, column * index + column / 2, y + 56);
+                }
+            }
+            Screen::ConfirmAdoptHistory => {
+                surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
+                draw_text(surf, font, "保留原画纸", 48.0, SCREEN_W / 4, y + 50);
+                draw_text(surf, font, "覆盖并继续画", 48.0, SCREEN_W * 3 / 4, y + 50);
             }
             Screen::ConfirmSend => {
                 surf.fill_rect(SCREEN_W / 2, y, 2, ACTION_BAR_H as usize, BLACK);
@@ -595,41 +946,6 @@ pub fn run() -> std::io::Result<()> {
         }
     }
 
-    fn render_refined_png(surf: &mut Surface, path: &Path) -> std::io::Result<()> {
-        let bytes = std::fs::read(path)?;
-        let (source_w, source_h, pixels) = decode_png_luma(&bytes)?;
-        if source_w == 0 || source_h == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "refined PNG has zero dimensions",
-            ));
-        }
-        let canvas_h = SCREEN_H - ACTION_BAR_H as usize;
-        let max_w = SCREEN_W.saturating_sub(40).max(1);
-        let max_h = canvas_h.saturating_sub(40).max(1);
-        let (target_w, target_h) =
-            if max_w.saturating_mul(source_h) <= max_h.saturating_mul(source_w) {
-                (max_w, (source_h.saturating_mul(max_w) / source_w).max(1))
-            } else {
-                ((source_w.saturating_mul(max_h) / source_h).max(1), max_h)
-            };
-        let x0 = (SCREEN_W - target_w) / 2;
-        let y0 = (canvas_h - target_h) / 2;
-        surf.fill_rect(0, 0, SCREEN_W, canvas_h, WHITE);
-        for y in 0..target_h {
-            let source_y = y.saturating_mul(source_h) / target_h;
-            for x in 0..target_w {
-                let source_x = x.saturating_mul(source_w) / target_w;
-                let value = pixels[source_y * source_w + source_x];
-                let red = (u16::from(value) * 31 / 255) << 11;
-                let green = (u16::from(value) * 63 / 255) << 5;
-                let blue = u16::from(value) * 31 / 255;
-                surf.put_px((x0 + x) as i32, (y0 + y) as i32, red | green | blue);
-            }
-        }
-        Ok(())
-    }
-
     fn wrap_reply(font: &FontRef, text: &str, px: f32, max_width: f32) -> Vec<String> {
         let mut lines = Vec::new();
         let mut current = String::new();
@@ -684,6 +1000,79 @@ pub fn run() -> std::io::Result<()> {
                         snapshot: &mut Option<Vec<u8>>,
                         base: &mut Option<Vec<u8>>| {
         match action {
+            Action::OpenHistory | Action::LoadHistory => {
+                if action == Action::OpenHistory {
+                    *snapshot = Some(surface.copy_rect(0, 0, SCREEN_W, SCREEN_H));
+                }
+                start_history_page(net_tx.clone(), outbox.clone(), state.history_cursor.clone());
+                render_controls(surface, &font, state);
+                display.update(
+                    0,
+                    SCREEN_H as i32 - ACTION_BAR_H,
+                    SCREEN_W as i32,
+                    ACTION_BAR_H,
+                    false,
+                );
+            }
+            Action::LoadHistoryItem => {
+                if let Some(view) = &state.history_pending {
+                    if let Some(entry) = view.items.get(view.index) {
+                        start_history_image(
+                            net_tx.clone(),
+                            outbox.clone(),
+                            entry.clone(),
+                            view.side,
+                        );
+                    }
+                }
+                render_controls(surface, &font, state);
+                display.update(
+                    0,
+                    SCREEN_H as i32 - ACTION_BAR_H,
+                    SCREEN_W as i32,
+                    ACTION_BAR_H,
+                    false,
+                );
+            }
+            Action::RenderHistory => {
+                if let Some(view) = &state.history_shown {
+                    let entry = &view.items[view.index];
+                    let path =
+                        HistoryCache::new(&outbox).image_path(entry.kind, entry.id, view.side);
+                    if let Err(error) = render_history_png(surface, &path, view) {
+                        state.history_failed(error.to_string());
+                    }
+                }
+                render_controls(surface, &font, state);
+                display.full_refresh(SCREEN_W, SCREEN_H);
+            }
+            Action::AdoptHistory => {
+                let result = state
+                    .history_shown
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("no history image"))
+                    .and_then(|view| {
+                        let entry = &view.items[view.index];
+                        let path =
+                            HistoryCache::new(&outbox).image_path(entry.kind, entry.id, view.side);
+                        render_refined_png(surface, &path)
+                    });
+                if result.is_ok() {
+                    ink.clear();
+                    *base =
+                        Some(surface.copy_rect(0, 0, SCREEN_W, SCREEN_H - ACTION_BAR_H as usize));
+                    snapshot.take();
+                } else {
+                    state.has_ink = state.history_original_ink;
+                    if let Some(saved) = snapshot.take() {
+                        surface.paste_rect(0, 0, SCREEN_W, SCREEN_H, &saved);
+                    } else {
+                        render_compose_shell(surface, &font);
+                    }
+                }
+                render_controls(surface, &font, state);
+                display.full_refresh(SCREEN_W, SCREEN_H);
+            }
             Action::Upload => {
                 let export = if base.is_some() {
                     write_canvas_png(surface, &page_path, SCREEN_H - ACTION_BAR_H as usize)
@@ -745,7 +1134,7 @@ pub fn run() -> std::io::Result<()> {
                 display.full_refresh(SCREEN_W, SCREEN_H);
                 let _ = std::fs::remove_file(&page_path);
             }
-            Action::DismissReply | Action::DismissRefinement => {
+            Action::DismissReply | Action::DismissRefinement | Action::CloseHistory => {
                 if let Some(saved) = snapshot.take() {
                     surface.paste_rect(0, 0, SCREEN_W, SCREEN_H, &saved);
                 } else {
@@ -780,6 +1169,34 @@ pub fn run() -> std::io::Result<()> {
         let now_ms = started.elapsed().as_millis() as u64;
         while let Ok(result) = net_rx.try_recv() {
             match result {
+                NetResult::HistoryPage(result) => {
+                    let action = state.history_page_finished(result);
+                    apply_action(
+                        action,
+                        &mut state,
+                        &mut ink,
+                        &mut surface,
+                        &display,
+                        &mut compose_snapshot,
+                        &mut base_snapshot,
+                    );
+                    if matches!(state.screen, Screen::HistoryEmpty) {
+                        display.full_refresh(SCREEN_W, SCREEN_H);
+                    }
+                }
+                NetResult::HistoryImage(result) => {
+                    let result = result.and_then(|path| {
+                        let view = state
+                            .history_pending
+                            .as_ref()
+                            .ok_or_else(|| "no pending history image".to_string())?;
+                        render_history_png(&mut surface, &path, view)
+                            .map_err(|error| error.to_string())
+                    });
+                    state.history_image_finished(result);
+                    render_controls(&mut surface, &font, &state);
+                    display.full_refresh(SCREEN_W, SCREEN_H);
+                }
                 NetResult::Upload(result) => {
                     let action = state.upload_finished(result);
                     apply_action(
@@ -955,10 +1372,11 @@ mod tests {
     fn center(target: ComposeTarget) -> (i32, i32) {
         let y = SCREEN_H as i32 - ACTION_BAR_H / 2;
         match target {
-            ComposeTarget::Send => (SCREEN_W as i32 / 8, y),
-            ComposeTarget::Refine => (SCREEN_W as i32 * 3 / 8, y),
-            ComposeTarget::Inbox => (SCREEN_W as i32 * 5 / 8, y),
-            ComposeTarget::Clear => (SCREEN_W as i32 * 7 / 8, y),
+            ComposeTarget::Send => (SCREEN_W as i32 / 10, y),
+            ComposeTarget::Refine => (SCREEN_W as i32 * 3 / 10, y),
+            ComposeTarget::History => (SCREEN_W as i32 * 5 / 10, y),
+            ComposeTarget::Inbox => (SCREEN_W as i32 * 7 / 10, y),
+            ComposeTarget::Clear => (SCREEN_W as i32 * 9 / 10, y),
             ComposeTarget::Canvas => (SCREEN_W as i32 / 2, 200),
             ComposeTarget::Outside => (-1, -1),
         }
@@ -977,6 +1395,7 @@ mod tests {
         for target in [
             ComposeTarget::Send,
             ComposeTarget::Refine,
+            ComposeTarget::History,
             ComposeTarget::Inbox,
             ComposeTarget::Clear,
         ] {
@@ -1176,7 +1595,355 @@ mod tests {
     #[test]
     fn bundled_mailbox_font_contains_chinese_glyphs() {
         let font = FontRef::try_from_slice(MAILBOX_FONT_TTF).unwrap();
-        assert_ne!(font.glyph_id('纸').0, 0);
-        assert_ne!(font.glyph_id('飞').0, 0);
+        let assert_glyphs = |text: &str| {
+            for character in text.chars() {
+                assert_ne!(
+                    font.glyph_id(character).0,
+                    0,
+                    "missing glyph U+{:04X} ({character:?}) in {text:?}",
+                    character as u32,
+                );
+            }
+        };
+        for text in [
+            "发送",
+            "AI润色",
+            "历史",
+            "收信",
+            "清空",
+            "正在读取历史图画……",
+            "还没有历史图画",
+            "点一下回到画纸",
+            "上一张",
+            "下一张",
+            "看原图",
+            "看AI图",
+            "单张图",
+            "继续画",
+            "返回",
+            "保留原画纸",
+            "覆盖并继续画",
+            "取消",
+            "再试一次",
+            " •-…AI0123456789",
+        ] {
+            assert_glyphs(text);
+        }
+        for (kind, side) in [
+            (HistoryKind::Message, HistoryImageSide::Output),
+            (HistoryKind::Refinement, HistoryImageSide::Output),
+            (HistoryKind::Refinement, HistoryImageSide::Input),
+        ] {
+            for created_at in ["2026-01-23T00:00:00Z", "legacy"] {
+                let mut entry = history_entries().remove(0);
+                entry.kind = kind;
+                entry.has_reply = kind == HistoryKind::Message;
+                entry.created_at = created_at.to_string();
+                let mut view = HistoryView {
+                    items: vec![entry; 10],
+                    next_cursor: None,
+                    index: 0,
+                    side,
+                };
+                for index in 0..view.items.len() {
+                    view.index = index;
+                    assert_glyphs(&history_summary(&view));
+                }
+            }
+        }
+    }
+
+    fn history_entries() -> Vec<HistoryEntry> {
+        vec![
+            HistoryEntry {
+                kind: HistoryKind::Refinement,
+                id: 1,
+                created_at: "2026-11-15T00:00:00Z".into(),
+                input_available: true,
+                has_reply: false,
+                model: "MAI-Image-2.6".into(),
+            },
+            HistoryEntry {
+                kind: HistoryKind::Message,
+                id: 2,
+                created_at: "2026-11-14T00:00:00Z".into(),
+                input_available: false,
+                has_reply: true,
+                model: String::new(),
+            },
+        ]
+    }
+
+    fn history_tap(state: &mut MailboxState, column: i32) -> Action {
+        state.tap(
+            SCREEN_W as i32 / 5 * column + SCREEN_W as i32 / 10,
+            SCREEN_H as i32 - ACTION_BAR_H / 2,
+            0,
+        )
+    }
+
+    fn open_history(has_ink: bool, next_cursor: Option<String>) -> MailboxState {
+        let mut state = MailboxState::new(0, 0);
+        state.has_ink = has_ink;
+        assert_eq!(history_tap(&mut state, 2), Action::OpenHistory);
+        assert_eq!(state.screen, Screen::LoadingHistory);
+        assert_eq!(state.has_ink, has_ink);
+        assert_eq!(history_tap(&mut state, 4), Action::None);
+        assert_eq!(
+            state.history_page_finished(Ok(HistoryPage {
+                items: history_entries(),
+                next_cursor
+            })),
+            Action::LoadHistoryItem
+        );
+        state.history_image_finished(Ok(()));
+        assert!(matches!(state.screen, Screen::History(_)));
+        state
+    }
+
+    #[test]
+    fn history_empty_dismisses_and_preserves_original_ink() {
+        for has_ink in [false, true] {
+            let mut state = MailboxState::new(0, 0);
+            state.has_ink = has_ink;
+            assert_eq!(history_tap(&mut state, 2), Action::OpenHistory);
+            assert_eq!(
+                state.history_page_finished(Ok(HistoryPage {
+                    items: vec![],
+                    next_cursor: None
+                })),
+                Action::None
+            );
+            assert_eq!(state.screen, Screen::HistoryEmpty);
+            assert_eq!(state.tick(120_000), Action::None);
+            assert_eq!(state.tap(10, 10, 0), Action::CloseHistory);
+            assert_eq!(state.screen, Screen::Compose);
+            assert_eq!(state.has_ink, has_ink);
+        }
+    }
+
+    #[test]
+    fn history_browsing_has_fixed_columns_and_resets_sides() {
+        let mut state = open_history(true, None);
+        assert_eq!(history_tap(&mut state, 0), Action::None);
+        assert_eq!(state.tap(10, 10, 0), Action::None);
+        assert_eq!(history_tap(&mut state, 2), Action::LoadHistoryItem);
+        assert_eq!(
+            state.history_pending.as_ref().unwrap().side,
+            HistoryImageSide::Input
+        );
+        state.history_image_finished(Ok(()));
+        assert_eq!(history_tap(&mut state, 2), Action::LoadHistoryItem);
+        state.history_image_finished(Ok(()));
+        assert_eq!(
+            state.history_shown.as_ref().unwrap().side,
+            HistoryImageSide::Output
+        );
+        assert_eq!(history_tap(&mut state, 1), Action::LoadHistoryItem);
+        state.history_image_finished(Ok(()));
+        assert_eq!(state.history_shown.as_ref().unwrap().index, 1);
+        assert_eq!(history_tap(&mut state, 2), Action::None);
+        assert_eq!(history_tap(&mut state, 1), Action::None);
+        assert_eq!(history_tap(&mut state, 0), Action::LoadHistoryItem);
+        state.history_image_finished(Ok(()));
+        assert_eq!(state.history_shown.as_ref().unwrap().index, 0);
+        assert_eq!(
+            state.history_shown.as_ref().unwrap().side,
+            HistoryImageSide::Output
+        );
+        assert_eq!(history_tap(&mut state, 4), Action::CloseHistory);
+        assert!(state.has_ink);
+        let mut state = open_history(false, None);
+        assert_eq!(history_tap(&mut state, 4), Action::CloseHistory);
+        assert!(!state.has_ink);
+    }
+
+    #[test]
+    fn history_boundary_loads_next_page_and_preserves_earlier_items() {
+        let mut state = open_history(false, Some("2026-11-14T00:00:00Z|2|2".into()));
+        assert_eq!(history_tap(&mut state, 1), Action::LoadHistoryItem);
+        state.history_image_finished(Ok(()));
+        assert_eq!(history_tap(&mut state, 1), Action::LoadHistory);
+        assert_eq!(
+            state.history_cursor.as_deref(),
+            Some("2026-11-14T00:00:00Z|2|2")
+        );
+        let mut entry = history_entries().remove(0);
+        entry.id = 3;
+        entry.input_available = false;
+        entry.created_at = "legacy".into();
+        assert_eq!(
+            state.history_page_finished(Ok(HistoryPage {
+                items: vec![entry],
+                next_cursor: None
+            })),
+            Action::LoadHistoryItem
+        );
+        state.history_image_finished(Ok(()));
+        let shown = state.history_shown.as_ref().unwrap();
+        assert_eq!(
+            (shown.items.len(), shown.index, shown.side),
+            (3, 2, HistoryImageSide::Output)
+        );
+        assert!(history_summary(shown).contains("旧版记录"));
+        assert_eq!(history_tap(&mut state, 2), Action::None);
+        assert_eq!(history_tap(&mut state, 1), Action::None);
+        assert_eq!(history_tap(&mut state, 0), Action::LoadHistoryItem);
+        state.history_image_finished(Ok(()));
+        assert!(history_summary(state.history_shown.as_ref().unwrap()).ends_with("有回信"));
+    }
+
+    #[test]
+    fn history_adoption_requires_confirmation_only_for_unsent_ink() {
+        let mut empty = open_history(false, None);
+        assert_eq!(history_tap(&mut empty, 3), Action::AdoptHistory);
+        assert_eq!(empty.screen, Screen::Compose);
+        assert!(empty.has_ink);
+        let mut state = open_history(true, None);
+        assert_eq!(history_tap(&mut state, 2), Action::LoadHistoryItem);
+        state.history_image_finished(Ok(()));
+        let previous = state.screen.clone();
+        assert_eq!(history_tap(&mut state, 3), Action::None);
+        assert_eq!(state.screen, Screen::ConfirmAdoptHistory);
+        assert_eq!(state.tick(120_000), Action::None);
+        assert_eq!(state.tap(10, 10, 0), Action::None);
+        assert_eq!(state.screen, previous);
+        assert!(state.has_ink);
+        assert_eq!(history_tap(&mut state, 3), Action::None);
+        let (confirm_x, confirm_y) = confirm();
+        assert_eq!(state.tap(confirm_x, confirm_y, 0), Action::AdoptHistory);
+        assert_eq!(state.screen, Screen::Compose);
+        assert!(state.has_ink);
+    }
+
+    #[test]
+    fn history_errors_retry_exact_operation_or_cancel_to_last_shown() {
+        let mut state = MailboxState::new(0, 0);
+        state.has_ink = true;
+        history_tap(&mut state, 2);
+        state.history_page_finished(Err("offline".into()));
+        assert!(matches!(
+            state.screen,
+            Screen::Error {
+                retry: Retry::History,
+                ..
+            }
+        ));
+        assert_eq!(state.tick(120_000), Action::None);
+        let (confirm_x, confirm_y) = confirm();
+        assert_eq!(state.tap(confirm_x, confirm_y, 0), Action::LoadHistory);
+        state.history_page_finished(Err("offline".into()));
+        assert_eq!(state.tap(10, 10, 0), Action::CloseHistory);
+        assert!(state.has_ink);
+        let mut state = open_history(true, Some("2026-11-14T00:00:00Z|2|2".into()));
+        let first = state.screen.clone();
+        assert_eq!(history_tap(&mut state, 1), Action::LoadHistoryItem);
+        state.history_image_finished(Err("missing image".into()));
+        assert!(matches!(
+            state.screen,
+            Screen::Error {
+                retry: Retry::HistoryItem,
+                ..
+            }
+        ));
+        assert_eq!(state.tap(confirm_x, confirm_y, 0), Action::LoadHistoryItem);
+        assert_eq!(state.history_pending.as_ref().unwrap().index, 1);
+        state.history_image_finished(Err("offline".into()));
+        assert_eq!(state.tap(10, 10, 0), Action::RenderHistory);
+        assert_eq!(state.screen, first);
+        history_tap(&mut state, 1);
+        state.history_image_finished(Ok(()));
+        history_tap(&mut state, 1);
+        state.history_page_finished(Err("offline page".into()));
+        assert_eq!(state.tap(confirm_x, confirm_y, 0), Action::LoadHistory);
+        assert_eq!(
+            state.history_cursor.as_deref(),
+            Some("2026-11-14T00:00:00Z|2|2")
+        );
+        state.history_page_finished(Err("offline page".into()));
+        assert_eq!(state.tap(10, 10, 0), Action::RenderHistory);
+        assert_eq!(state.history_shown.as_ref().unwrap().index, 1);
+    }
+
+    #[test]
+    fn idle_poll_never_interrupts_history_or_other_modal_screens() {
+        let view = HistoryView {
+            items: history_entries(),
+            next_cursor: None,
+            index: 0,
+            side: HistoryImageSide::Output,
+        };
+        for screen in [
+            Screen::LoadingHistory,
+            Screen::HistoryEmpty,
+            Screen::History(view),
+            Screen::ConfirmAdoptHistory,
+            Screen::ConfirmSend,
+            Screen::ConfirmRefine,
+            Screen::ConfirmClear,
+            Screen::Sending,
+            Screen::Refining,
+            Screen::CheckingInbox,
+            Screen::Refined,
+            Screen::Reply {
+                id: 1,
+                body: "hello".into(),
+            },
+            Screen::Error {
+                message: "offline".into(),
+                retry: Retry::History,
+            },
+        ] {
+            let mut state = MailboxState::new(0, 0);
+            state.screen = screen.clone();
+            assert_eq!(state.tick(120_000), Action::None, "{screen:?}");
+            assert_eq!(state.screen, screen);
+        }
+    }
+
+    #[test]
+    fn adopting_history_rerenders_clean_canvas_without_header_in_export() {
+        use crate::surface::{PixFmt, Surface};
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 2, 3);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[255; 6])
+                .unwrap();
+        }
+        let dir = std::env::temp_dir().join(format!("history-render-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.png");
+        std::fs::write(&path, encoded).unwrap();
+        let mut bytes = vec![255; SCREEN_W * SCREEN_H];
+        let mut surf = Surface::new(
+            bytes.as_mut_ptr(),
+            bytes.len(),
+            SCREEN_W,
+            SCREEN_H,
+            SCREEN_W,
+            PixFmt::Gray8,
+        );
+        let view = HistoryView {
+            items: history_entries(),
+            next_cursor: None,
+            index: 0,
+            side: HistoryImageSide::Output,
+        };
+        render_history_png(&mut surf, &path, &view).unwrap();
+        assert!(bytes[..SCREEN_W * 84].iter().any(|&pixel| pixel != 255));
+        render_refined_png(&mut surf, &path).unwrap();
+        assert!(bytes[..SCREEN_W * (SCREEN_H - ACTION_BAR_H as usize)]
+            .iter()
+            .all(|&pixel| pixel == 255));
+        let export = dir.join("compose.png");
+        write_canvas_png(&surf, &export, SCREEN_H - ACTION_BAR_H as usize).unwrap();
+        let (_, _, pixels) = decode_png_luma(&std::fs::read(export).unwrap()).unwrap();
+        assert!(pixels.iter().all(|&pixel| pixel == 255));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

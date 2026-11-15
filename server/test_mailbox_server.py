@@ -219,6 +219,65 @@ class MailboxHTTPTests(unittest.TestCase):
         self.assertNotIn(self.device_token.encode(), body)
         self.assertNotIn(self.family_token.encode(), body)
 
+    def test_history_auth_precedes_storage_and_validation(self):
+        from unittest.mock import patch
+        with patch.object(self.store, "history_page", side_effect=AssertionError("storage accessed")), \
+                patch.object(self.store, "image_path_for_message", side_effect=AssertionError("storage accessed")):
+            for path in ("/api/device/history?limit=wrong", "/api/device/history/messages/1.png"):
+                for headers in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": f"Bearer {self.family_token}"}):
+                    status, response_headers, body = self.request("GET", path, headers=headers)
+                    self.assertEqual(status, 401)
+                    self.assertEqual(response_headers["WWW-Authenticate"], 'Bearer realm="paper-plane-device"')
+                    self.assertEqual(body, b"unauthorized\n")
+
+    def test_history_strict_query_validation(self):
+        queries = ("limit=0", "limit=51", "limit=01", "limit=-1", "limit=1.0", "limit=",
+                   "limit=1&limit=2", "cursor=x", "cursor=", "unknown=1", "cursor=x&cursor=x",
+                   "cursor=2026-11-15T00:00:00Z%7C3%7C1",
+                   "cursor=2026-11-15T00:00:00Z%7C2%7C9007199254740992")
+        for query in queries:
+            with self.subTest(query=query):
+                self.assertEqual(self.request("GET", "/api/device/history?" + query,
+                                              headers=self.device_headers)[0], 400)
+
+    def test_history_pagination_tsv_and_device_image(self):
+        ids = [self.store.create_message("ian-kobo", make_png()) for _ in range(5)]
+        self.store.create_reply(ids[3], "hello")
+        with self.store._connect() as database:
+            database.execute("UPDATE messages SET created_at = '2026-11-15T00:00:00Z'")
+            database.execute("UPDATE messages SET created_at = 'legacy' WHERE id = ?", (ids[-1],))
+        collected = []
+        path = "/api/device/history?limit=2"
+        while True:
+            status, headers, body = self.request("GET", path, headers=self.device_headers)
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["Content-Type"], "text/tab-separated-values; charset=utf-8")
+            self.assertEqual(headers["Cache-Control"], "no-store")
+            self.assertTrue(body.endswith(b"\n"))
+            for line in body.decode().splitlines():
+                fields = line.split("\t")
+                self.assertEqual(len(fields), 6)
+                self.assertEqual(fields[0], "message")
+                self.assertEqual(fields[3], "0")
+                self.assertEqual(fields[5], "")
+                self.assertEqual(fields[4], "1" if fields[1] == str(ids[3]) else "0")
+                collected.append(int(fields[1]))
+            if "X-Next-Cursor" not in headers:
+                break
+            path = "/api/device/history?limit=2&cursor=" + urllib.parse.quote(headers["X-Next-Cursor"])
+        self.assertEqual(collected, [4, 3, 2, 1, 5])
+        status, headers, body = self.request("GET", f"/api/device/history/messages/{ids[0]}.png",
+                                             headers=self.device_headers)
+        self.assertEqual((status, headers["Content-Type"], body), (200, "image/png", make_png()))
+        for path in ("/api/device/history/messages/999.png", "/api/device/history/messages/1.png?x=1",
+                     "/api/device/history/refinements/1/output.png"):
+            self.assertEqual(self.request("GET", path, headers=self.device_headers)[0], 404)
+
+    def test_history_empty(self):
+        status, headers, body = self.request("GET", "/api/device/history", headers=self.device_headers)
+        self.assertEqual((status, body), (200, b""))
+        self.assertNotIn("X-Next-Cursor", headers)
+
     def test_device_routes_require_exact_bearer_token(self):
         for authorization in (
             None,

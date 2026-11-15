@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 import worker, {
   azureOpenAiRefinementModels,
@@ -112,6 +114,124 @@ const env = {
   MAILBOX_FAMILY_TOKEN: "family-secret",
   MAILBOX_DB: memoryRefinementDb(),
 };
+
+function historyDb(messages = [], refinements = [], replies = []) {
+  const migrations = ["0001_init.sql", "0002_refinement_history.sql", "0003_refinement_legacy_inputs.sql", "0004_history_indexes.sql"];
+  const schema = migrations.map((name) => readFileSync(new URL(`../migrations/${name}`, import.meta.url), "utf8")).join("\n");
+  return {
+    prepare(sql) {
+      let bindings = [];
+      const query = () => {
+        const result = spawnSync("python3", ["-c", `
+import json, sqlite3, sys
+data = json.load(sys.stdin)
+db = sqlite3.connect(':memory:')
+db.row_factory = sqlite3.Row
+db.executescript(data['schema'])
+for table in ('messages', 'refinements', 'replies'):
+    for row in data[table]:
+        keys = list(row)
+        db.execute('INSERT INTO ' + table + ' (' + ','.join(keys) + ') VALUES (' + ','.join('?' for _ in keys) + ')', list(row.values()))
+print(json.dumps([dict(row) for row in db.execute(data['sql'], data['bindings'])]))
+`], { input: JSON.stringify({ schema, messages, refinements, replies, sql, bindings }), encoding: "utf8" });
+        assert.equal(result.status, 0, result.stderr);
+        return JSON.parse(result.stdout);
+      };
+      return {
+        bind(...values) { bindings = values; return this; },
+        async all() { return { results: query() }; },
+        async first() { return query()[0] ?? null; },
+      };
+    },
+  };
+}
+
+function deviceHistoryRequest(path, authorization = "Bearer device-secret") {
+  return new Request(`https://example.test/api/device/history${path}`, {
+    headers: authorization ? { Authorization: authorization } : {},
+  });
+}
+
+test("device history authenticates before validation or any storage access", async () => {
+  const forbiddenStorage = new Proxy({}, { get() { throw new Error("storage accessed"); } });
+  for (const path of ["?limit=bad", "/messages/1.png", "/refinements/1/input.png", "/refinements/1/output.png?x=1"]) {
+    for (const auth of [null, "Bearer wrong", "Bearer family-secret"]) {
+      const response = await worker.fetch(deviceHistoryRequest(path, auth), {
+        ...env, MAILBOX_DB: forbiddenStorage, MAILBOX_IMAGES: forbiddenStorage,
+      });
+      assert.equal(response.status, 401);
+      assert.equal(response.headers.get("WWW-Authenticate"), 'Bearer realm="paper-plane-device"');
+      assert.equal(await response.text(), "unauthorized\n");
+    }
+  }
+});
+
+test("device history rejects duplicate, unknown and malformed parameters", async () => {
+  for (const query of ["limit=0", "limit=51", "limit=-1", "limit=01", "limit=1.5", "limit=", "limit=1e1",
+    "limit=1&limit=2", "unknown=1", "cursor=", "cursor=x", "cursor=x&cursor=x",
+    ...["legacy|1|1", "2026-11-15T00:00:00Z|3|1", "2026-11-15T00:00:00Z|2|0",
+      "2026-11-15T00:00:00Z|2|01", "2026-11-15T00:00:00Z|2|9007199254740992",
+      "2026-11-15T00:00:00.000Z|2|1"].map((cursor) => `cursor=${encodeURIComponent(cursor)}`)]) {
+    const response = await worker.fetch(deviceHistoryRequest(`?${query}`), env);
+    assert.equal(response.status, 400, query);
+  }
+});
+
+function historyFixtures() {
+  const timestamp = "2026-11-15T02:36:40Z";
+  const messages = [1, 2, 3].map((id) => ({ id, device_id: "kobo", image_key: `message-${id}`, created_at: timestamp }));
+  const refinements = [1, 2, 3, 4, 5].map((id) => ({ id, device_id: "kobo", refinement_key: `key-${id}`,
+    input_key: `input-${id}`, output_key: `output-${id}`, input_available: id === 3 ? 0 : 1,
+    model: id === 3 ? "old\tmodel\r\n" : "MAI-Image-2.6", created_at: id >= 3 ? "legacy" : timestamp }));
+  const replies = [{ id: 1, message_id: 2, body: "hello", created_at: timestamp }];
+  return { ...env, MAILBOX_DB: historyDb(messages, refinements, replies), MAILBOX_IMAGES: memoryKv() };
+}
+
+test("device history uses real SQLite ordering and gap-free keyset pagination, legacy last", async () => {
+  const historyEnv = historyFixtures();
+  let cursor = null;
+  const items = [];
+  do {
+    const response = await worker.fetch(deviceHistoryRequest(`?limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`), historyEnv);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Type"), "text/tab-separated-values; charset=utf-8");
+    for (const [key, value] of Object.entries({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY" })) assert.equal(response.headers.get(key), value);
+    const text = await response.text();
+    assert.ok(text.endsWith("\n"));
+    const page = text.trimEnd().split("\n").map((line) => line.split("\t"));
+    const fields = text.slice(0, -1).split("\n").map((line) => line.split("\t"));
+    assert.equal(page.length, 2);
+    for (const row of fields) assert.equal(row.length, 6);
+    items.push(...fields);
+    cursor = response.headers.get("X-Next-Cursor");
+  } while (cursor);
+  assert.deepEqual(items.map((row) => `${row[0]}-${row[1]}`), ["message-3", "message-2", "message-1", "refinement-2", "refinement-1", "refinement-5", "refinement-4", "refinement-3"]);
+  assert.equal(items[1][4], "1");
+  assert.equal(items[0][4], "0");
+  assert.equal(items.at(-1)[2], "legacy");
+  assert.equal(items.at(-1)[3], "0");
+  assert.equal(items.at(-1)[5], "oldmodel");
+  const empty = await worker.fetch(deviceHistoryRequest(""), { ...env, MAILBOX_DB: historyDb() });
+  assert.equal(await empty.text(), "");
+  assert.equal(empty.headers.get("X-Next-Cursor"), null);
+});
+
+test("device history downloads message and both refinement sides, rejects absent images", async () => {
+  const historyEnv = historyFixtures();
+  const png = makePng();
+  for (const key of ["message-1", "input-1", "output-1", "output-3"]) await historyEnv.MAILBOX_IMAGES.put(key, png);
+  for (const path of ["/messages/1.png", "/refinements/1/input.png", "/refinements/1/output.png", "/refinements/3/output.png"]) {
+    const response = await worker.fetch(deviceHistoryRequest(path), historyEnv);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Type"), "image/png");
+    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), png);
+  }
+  for (const path of ["/messages/999.png", "/messages/2.png", "/refinements/999/output.png", "/refinements/3/input.png",
+    "/messages/1.png?x=1", "/messages/01.png", "/refinements/1/other.png"]) {
+    assert.equal((await worker.fetch(deviceHistoryRequest(path), historyEnv)).status, 404, path);
+  }
+});
 
 function memoryKv() {
   const values = new Map();

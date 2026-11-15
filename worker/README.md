@@ -97,3 +97,15 @@ Opening it once exchanges the URL token for a `Secure`, `HttpOnly`, `SameSite=St
 A message insert stores the PNG in KV first, then inserts its D1 metadata. If D1 insertion fails, the Worker deletes the newly written KV object. Deleting a message from D1 cascades its reply, but operational cleanup must also delete the corresponding KV image key.
 
 Private responses use `Cache-Control: no-store`, capability tokens are compared via fixed-length SHA-256 digests, and family content is escaped before HTML rendering. Cloudflare may reject a few edge-level methods (for example `TRACE`) before the Worker runs; methods that reach the Worker return `405` with `Allow: GET, POST` and `no-store`.
+# Kobo device history
+
+`GET /api/device/history?limit=20&cursor=<sort_time>|<kind_rank>|<id>` returns
+newline-terminated TSV (`kind`, `id`, `created_at`, `input_available`,
+`has_reply`, `model`), newest first. `limit` is 1–50; an optional
+`X-Next-Cursor` response header identifies the next page. Legacy refinements
+sort after timestamped records. Apply migration `0004_history_indexes.sql`.
+
+Download PNGs using `GET /api/device/history/messages/<id>.png` or
+`GET /api/device/history/refinements/<id>/(input|output).png` (no query parameters).
+All these routes require `Authorization: Bearer <MAILBOX_DEVICE_TOKEN>`;
+never install the family token on Kobo. Responses are private and not cached.

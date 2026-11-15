@@ -6,12 +6,275 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REPLY_BYTES: u64 = 8 * 1024;
 const MAX_REFINED_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_HISTORY_BYTES: u64 = 256 * 1024;
+const MAX_CACHE_FILES: usize = 64;
+const MAX_CACHE_BYTES: u64 = 96 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryKind {
+    Message,
+    Refinement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryImageSide {
+    Output,
+    Input,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub kind: HistoryKind,
+    pub id: u64,
+    pub created_at: String,
+    pub input_available: bool,
+    pub has_reply: bool,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryPage {
+    pub items: Vec<HistoryEntry>,
+    pub next_cursor: Option<String>,
+}
+
+fn invalid_history() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid mailbox history response",
+    )
+}
+
+fn valid_history_cursor(cursor: &str) -> bool {
+    let fields: Vec<_> = cursor.split('|').collect();
+    if fields.len() != 3 || !matches!(fields[1], "1" | "2") {
+        return false;
+    }
+    let time = fields[0].as_bytes();
+    time.len() == 20
+        && time.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            10 => *byte == b'T',
+            13 | 16 => *byte == b':',
+            19 => *byte == b'Z',
+            _ => byte.is_ascii_digit(),
+        })
+        && positive_id(fields[2]).is_some_and(|id| id <= 9_007_199_254_740_991)
+}
+
+fn positive_id(text: &str) -> Option<u64> {
+    if text.starts_with('0') || text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+fn parse_history(bytes: &[u8], next_cursor: Option<String>) -> io::Result<HistoryPage> {
+    if bytes.len() as u64 > MAX_HISTORY_BYTES
+        || (!bytes.is_empty() && !bytes.ends_with(b"\n"))
+        || next_cursor
+            .as_deref()
+            .is_some_and(|cursor| !valid_history_cursor(cursor))
+    {
+        return Err(invalid_history());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| invalid_history())?;
+    let mut items = Vec::new();
+    for line in text.split_terminator('\n') {
+        let fields: Vec<_> = line.split('\t').collect();
+        if fields.len() != 6 || line.contains('\r') {
+            return Err(invalid_history());
+        }
+        let flag = |text| match text {
+            "0" => Ok(false),
+            "1" => Ok(true),
+            _ => Err(invalid_history()),
+        };
+        items.push(HistoryEntry {
+            kind: match fields[0] {
+                "message" => HistoryKind::Message,
+                "refinement" => HistoryKind::Refinement,
+                _ => return Err(invalid_history()),
+            },
+            id: positive_id(fields[1]).ok_or_else(invalid_history)?,
+            created_at: fields[2].to_string(),
+            input_available: flag(fields[3])?,
+            has_reply: flag(fields[4])?,
+            model: fields[5].to_string(),
+        });
+        if items.len() > 50 {
+            return Err(invalid_history());
+        }
+    }
+    if items.is_empty() && next_cursor.is_some() {
+        return Err(invalid_history());
+    }
+    Ok(HistoryPage { items, next_cursor })
+}
+
+fn history_tsv(items: &[HistoryEntry]) -> String {
+    items
+        .iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                HistoryKind::Message => "message",
+                HistoryKind::Refinement => "refinement",
+            };
+            format!(
+                "{kind}\t{}\t{}\t{}\t{}\t{}\n",
+                entry.id,
+                entry.created_at,
+                u8::from(entry.input_available),
+                u8::from(entry.has_reply),
+                entry.model
+            )
+        })
+        .collect()
+}
+
+pub struct HistoryCache {
+    root: PathBuf,
+}
+
+impl HistoryCache {
+    pub fn new(outbox: impl AsRef<Path>) -> Self {
+        Self {
+            root: outbox.as_ref().join("history-cache"),
+        }
+    }
+
+    pub fn image_path(&self, kind: HistoryKind, id: u64, side: HistoryImageSide) -> PathBuf {
+        let name = match (kind, side) {
+            (HistoryKind::Message, _) => format!("message-{id}.png"),
+            (HistoryKind::Refinement, HistoryImageSide::Output) => {
+                format!("refinement-{id}-output.png")
+            }
+            (HistoryKind::Refinement, HistoryImageSide::Input) => {
+                format!("refinement-{id}-input.png")
+            }
+        };
+        self.root.join(name)
+    }
+
+    pub fn list_history(
+        &self,
+        client: &MailboxClient,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> io::Result<HistoryPage> {
+        match client.list_history(cursor, limit) {
+            Ok(page) => {
+                if cursor.is_none() {
+                    fs::create_dir_all(&self.root)?;
+                    atomic_write(
+                        &self.root.join("index.tsv"),
+                        history_tsv(&page.items).as_bytes(),
+                    )?;
+                }
+                Ok(page)
+            }
+            Err(error)
+                if cursor.is_none()
+                    && error.kind() != io::ErrorKind::InvalidData
+                    && error.kind() != io::ErrorKind::InvalidInput =>
+            {
+                let cached = fs::File::open(self.root.join("index.tsv"));
+                let Ok(file) = cached else {
+                    return Err(error);
+                };
+                let mut bytes = Vec::new();
+                file.take(MAX_HISTORY_BYTES + 1).read_to_end(&mut bytes)?;
+                let mut page = parse_history(&bytes, None)?;
+                page.items.truncate(limit);
+                Ok(page)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn fetch_image(
+        &self,
+        client: &MailboxClient,
+        kind: HistoryKind,
+        id: u64,
+        side: HistoryImageSide,
+    ) -> io::Result<PathBuf> {
+        if id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid history ID",
+            ));
+        }
+        let path = self.image_path(kind, id, side);
+        if cached_png_valid(&path) {
+            return Ok(path);
+        }
+        fs::create_dir_all(&self.root)?;
+        client.fetch_history_image(kind, id, side, &path)?;
+        self.prune(&path)?;
+        Ok(path)
+    }
+
+    fn prune(&self, protected: &Path) -> io::Result<()> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry.path().extension().is_some_and(|ext| ext == "png")
+            {
+                let metadata = entry.metadata()?;
+                files.push((metadata.modified()?, entry.path(), metadata.len()));
+            }
+        }
+        files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let mut count = files.len();
+        let mut bytes: u64 = files.iter().map(|file| file.2).sum();
+        for (_, path, length) in files {
+            if count <= MAX_CACHE_FILES && bytes <= MAX_CACHE_BYTES {
+                break;
+            }
+            if path == protected {
+                continue;
+            }
+            fs::remove_file(path)?;
+            count -= 1;
+            bytes -= length;
+        }
+        Ok(())
+    }
+}
+
+fn cached_png_valid(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file() && metadata.len() > 0 && metadata.len() <= MAX_REFINED_IMAGE_BYTES
+    }) && fs::File::open(path).is_ok_and(|mut file| {
+        let mut signature = [0; 8];
+        file.read_exact(&mut signature).is_ok() && is_png(&signature)
+    })
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp_path = path.with_extension(format!(
+        "{}.part",
+        path.extension().unwrap_or_default().to_string_lossy()
+    ));
+    let result = (|| {
+        let mut file = fs::File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp_path);
+    }
+    result
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
@@ -113,6 +376,70 @@ impl MailboxClient {
         })
     }
 
+    pub fn list_history(&self, cursor: Option<&str>, limit: usize) -> io::Result<HistoryPage> {
+        if !(1..=50).contains(&limit) || cursor.is_some_and(|value| !valid_history_cursor(value)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid history query",
+            ));
+        }
+        let mut request = self
+            .agent
+            .get(&format!("{}/api/device/history", self.base_url))
+            .query("limit", &limit.to_string())
+            .set("Authorization", &format!("Bearer {}", self.device_token));
+        if let Some(cursor) = cursor {
+            request = request.query("cursor", cursor);
+        }
+        let response = request.call().map_err(http_error)?;
+        if response.status() != 200 {
+            return Err(invalid_history());
+        }
+        let next_cursor = response.header("X-Next-Cursor").map(str::to_string);
+        let mut bytes = Vec::new();
+        response
+            .into_reader()
+            .take(MAX_HISTORY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| io::Error::other("mailbox history read failed"))?;
+        let page = parse_history(&bytes, next_cursor)?;
+        if page.items.len() > limit {
+            return Err(invalid_history());
+        }
+        Ok(page)
+    }
+
+    pub fn fetch_history_image(
+        &self,
+        kind: HistoryKind,
+        id: u64,
+        side: HistoryImageSide,
+        output_path: impl AsRef<Path>,
+    ) -> io::Result<()> {
+        if id == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid history ID",
+            ));
+        }
+        let route = match (kind, side) {
+            (HistoryKind::Message, _) => format!("messages/{id}.png"),
+            (HistoryKind::Refinement, HistoryImageSide::Output) => {
+                format!("refinements/{id}/output.png")
+            }
+            (HistoryKind::Refinement, HistoryImageSide::Input) => {
+                format!("refinements/{id}/input.png")
+            }
+        };
+        let response = self
+            .agent
+            .get(&format!("{}/api/device/history/{route}", self.base_url))
+            .set("Authorization", &format!("Bearer {}", self.device_token))
+            .call()
+            .map_err(http_error)?;
+        download_png(response, output_path.as_ref())
+    }
+
     pub fn refine_png(
         &self,
         input_path: impl AsRef<Path>,
@@ -140,59 +467,7 @@ impl MailboxClient {
             .set("X-Refinement-Key", &refinement_key(&png))
             .send_bytes(&png)
             .map_err(http_error)?;
-        let content_type = response
-            .header("Content-Type")
-            .unwrap_or_default()
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim();
-        if content_type != "image/png" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "refinement response is not image/png",
-            ));
-        }
-        if response
-            .header("Content-Length")
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|length| length > MAX_REFINED_IMAGE_BYTES)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "refinement response exceeds 16 MiB",
-            ));
-        }
-        let mut refined = Vec::new();
-        response
-            .into_reader()
-            .take(MAX_REFINED_IMAGE_BYTES + 1)
-            .read_to_end(&mut refined)?;
-        if refined.len() as u64 > MAX_REFINED_IMAGE_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "refinement response exceeds 16 MiB",
-            ));
-        }
-        if !is_png(&refined) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "refinement response is not a PNG",
-            ));
-        }
-
-        let output_path = output_path.as_ref();
-        let temp_path = output_path.with_extension("png.part");
-        let write_result = (|| {
-            let mut file = fs::File::create(&temp_path)?;
-            file.write_all(&refined)?;
-            file.sync_all()?;
-            fs::rename(&temp_path, output_path)
-        })();
-        if write_result.is_err() {
-            let _ = fs::remove_file(&temp_path);
-        }
-        write_result
+        download_png(response, output_path.as_ref())
     }
 
     pub fn poll_reply(&self, after: u64) -> io::Result<Option<Reply>> {
@@ -248,6 +523,57 @@ impl MailboxClient {
     }
 }
 
+fn download_png(response: ureq::Response, output_path: &Path) -> io::Result<()> {
+    if response.status() != 200 {
+        return Err(io::Error::other(format!(
+            "mailbox image returned HTTP {}",
+            response.status()
+        )));
+    }
+    let content_type = response
+        .header("Content-Type")
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    if content_type != "image/png" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refinement response is not image/png",
+        ));
+    }
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_REFINED_IMAGE_BYTES)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refinement response exceeds 16 MiB",
+        ));
+    }
+    let mut refined = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_REFINED_IMAGE_BYTES + 1)
+        .read_to_end(&mut refined)?;
+    if refined.len() as u64 > MAX_REFINED_IMAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refinement response exceeds 16 MiB",
+        ));
+    }
+    if !is_png(&refined) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "refinement response is not a PNG",
+        ));
+    }
+
+    atomic_write(output_path, &refined)
+}
+
 fn required_env(name: &str) -> io::Result<String> {
     std::env::var(name)
         .ok()
@@ -270,18 +596,10 @@ fn refinement_key(bytes: &[u8]) -> String {
 
 fn http_error(error: ureq::Error) -> io::Error {
     match error {
-        ureq::Error::Status(code, response) => {
-            let detail = response.into_string().unwrap_or_default();
-            let detail = detail.trim();
-            if detail.is_empty() {
-                io::Error::other(format!("mailbox server returned HTTP {code}"))
-            } else {
-                io::Error::other(format!("mailbox server returned HTTP {code}: {detail}"))
-            }
+        ureq::Error::Status(code, _) => {
+            io::Error::other(format!("mailbox server returned HTTP {code}"))
         }
-        ureq::Error::Transport(error) => {
-            io::Error::other(format!("mailbox request failed: {error}"))
-        }
+        ureq::Error::Transport(_) => io::Error::other("mailbox request failed"),
     }
 }
 
@@ -472,5 +790,247 @@ mod tests {
         let error = client.send_png(&path).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         let _ = fs::remove_file(path);
+    }
+
+    fn history_response(body: &[u8], headers: &str) -> &'static [u8] {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        Box::leak(response.into_boxed_slice())
+    }
+
+    fn history_test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("mailbox-history-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn history_list_encodes_cursor_and_parses_tsv_and_header() {
+        let cursor = "2026-11-15T02:36:40Z|2|3";
+        let body = b"message\t2\t2026-11-15T02:36:40Z\t0\t1\t\nrefinement\t1\tlegacy\t1\t0\tMAI-Image-2.6\n";
+        let (base, requests) = mock_server(history_response(
+            body,
+            "X-Next-Cursor: 0000-00-00T00:00:00Z|1|1\r\n",
+        ));
+        let client = MailboxClient::new(base, "history-secret", "kobo").unwrap();
+        let page = client.list_history(Some(cursor), 2).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.items[0].kind, HistoryKind::Message);
+        assert!(page.items[0].has_reply);
+        assert!(page.items[1].input_available);
+        assert_eq!(
+            page.next_cursor.as_deref(),
+            Some("0000-00-00T00:00:00Z|1|1")
+        );
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(request
+            .head
+            .contains("Authorization: Bearer history-secret\r\n"));
+        assert!(request
+            .head
+            .contains("limit=2&cursor=2026-11-15T02%3A36%3A40Z%7C2%7C3"));
+    }
+
+    #[test]
+    fn history_strict_parser_rejects_invalid_fields_and_oversized_body() {
+        for body in [
+            b"unknown\t1\tlegacy\t0\t0\t\n".as_slice(),
+            b"message\t0\tlegacy\t0\t0\t\n",
+            b"message\t01\tlegacy\t0\t0\t\n",
+            b"message\t1\tlegacy\t2\t0\t\n",
+            b"message\t1\tlegacy\t0\tx\t\n",
+            b"message\t1\tlegacy\t0\t0\n",
+            b"message\t1\tlegacy\t0\t0\t",
+            b"message\t1\tlegacy\t0\t0\t\r\n",
+            b"\xff\n",
+        ] {
+            assert!(parse_history(body, None).is_err());
+        }
+        assert!(parse_history(&vec![b'x'; MAX_HISTORY_BYTES as usize + 1], None).is_err());
+        assert!(parse_history(b"", Some("not-a-cursor".into())).is_err());
+        for (body, headers) in [
+            (vec![b'x'; MAX_HISTORY_BYTES as usize + 1], ""),
+            (
+                b"message\t1\tlegacy\t0\t0\t\n".to_vec(),
+                "X-Next-Cursor: wrong\r\n",
+            ),
+        ] {
+            let (base, _requests) = mock_server(history_response(&body, headers));
+            let client = MailboxClient::new(base, "secret", "kobo").unwrap();
+            assert!(client.list_history(None, 20).is_err());
+        }
+    }
+
+    #[test]
+    fn history_images_use_device_routes_and_cache_hits_skip_network() {
+        let dir = history_test_dir("images");
+        let cache = HistoryCache::new(&dir);
+        for (kind, id, side, route, filename) in [
+            (
+                HistoryKind::Message,
+                1,
+                HistoryImageSide::Output,
+                "messages/1.png",
+                "message-1.png",
+            ),
+            (
+                HistoryKind::Refinement,
+                2,
+                HistoryImageSide::Output,
+                "refinements/2/output.png",
+                "refinement-2-output.png",
+            ),
+            (
+                HistoryKind::Refinement,
+                2,
+                HistoryImageSide::Input,
+                "refinements/2/input.png",
+                "refinement-2-input.png",
+            ),
+        ] {
+            let (base, requests) =
+                mock_server(history_response(&test_png(), "Content-Type: image/png\r\n"));
+            let client = MailboxClient::new(base, "history-secret", "kobo").unwrap();
+            let path = cache.fetch_image(&client, kind, id, side).unwrap();
+            assert_eq!(path.file_name().unwrap(), filename);
+            let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(request
+                .head
+                .starts_with(&format!("GET /api/device/history/{route} HTTP/1.1\r\n")));
+            assert!(request
+                .head
+                .contains("Authorization: Bearer history-secret\r\n"));
+            assert_eq!(fs::read(&path).unwrap(), test_png());
+            assert_eq!(cache.fetch_image(&client, kind, id, side).unwrap(), path);
+            assert!(!path.with_extension("png.part").exists());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_cache_snapshot_survives_offline_and_invalid_cache_fails_cleanly() {
+        let dir = history_test_dir("offline");
+        let cache = HistoryCache::new(&dir);
+        let (base, _requests) = mock_server(history_response(b"message\t1\tlegacy\t0\t0\t\n", ""));
+        let online = MailboxClient::new(base, "secret", "kobo").unwrap();
+        let page = cache.list_history(&online, None, 20).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let offline = MailboxClient::new(base, "secret", "kobo").unwrap();
+        assert_eq!(cache.list_history(&offline, None, 20).unwrap(), page);
+        assert!(cache
+            .list_history(&offline, Some("0000-00-00T00:00:00Z|2|1"), 20)
+            .is_err());
+        fs::write(cache.root.join("index.tsv"), "bad").unwrap();
+        assert_eq!(
+            cache.list_history(&offline, None, 20).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::remove_file(cache.root.join("index.tsv")).unwrap();
+        assert!(cache.list_history(&offline, None, 20).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_cache_prunes_file_count_and_bytes_and_protects_current_image() {
+        let dir = history_test_dir("prune");
+        let cache = HistoryCache::new(&dir);
+        fs::create_dir_all(&cache.root).unwrap();
+        let protected = cache.root.join("message-1.png");
+        fs::write(&protected, test_png()).unwrap();
+        for id in 2..=70 {
+            fs::write(cache.root.join(format!("message-{id}.png")), test_png()).unwrap();
+        }
+        fs::write(cache.root.join("index.tsv"), "snapshot").unwrap();
+        cache.prune(&protected).unwrap();
+        assert!(protected.exists());
+        assert_eq!(
+            fs::read_dir(&cache.root)
+                .unwrap()
+                .filter(|entry| entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "png"))
+                .count(),
+            64
+        );
+        assert!(cache.root.join("index.tsv").exists());
+        for entry in fs::read_dir(&cache.root).unwrap() {
+            let path = entry.unwrap().path();
+            if path != protected && path.extension().is_some_and(|ext| ext == "png") {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        for id in 2..=8 {
+            let file =
+                fs::File::create(cache.root.join(format!("refinement-{id}-output.png"))).unwrap();
+            file.set_len(MAX_REFINED_IMAGE_BYTES).unwrap();
+        }
+        cache.prune(&protected).unwrap();
+        let bytes: u64 = fs::read_dir(&cache.root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum();
+        assert!(bytes <= MAX_CACHE_BYTES);
+        assert!(protected.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_http_errors_never_include_echoed_secrets() {
+        let (base, _requests) = mock_server(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\nConnection: close\r\n\r\nsecret-token");
+        let client = MailboxClient::new(base, "secret-token", "kobo").unwrap();
+        let error = client.list_history(None, 20).unwrap_err().to_string();
+        assert!(error.contains("401"));
+        assert!(!error.contains("secret-token"));
+    }
+
+    #[test]
+    fn history_image_validation_preserves_destination_and_repairs_invalid_cache() {
+        let dir = history_test_dir("invalid-images");
+        let path = dir.join("output.png");
+        for response in [history_response(&test_png(), "Content-Type: text/plain\r\n"),
+            history_response(b"not a PNG", "Content-Type: image/png\r\n"),
+            b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 16777217\r\nConnection: close\r\n\r\n"] {
+            fs::write(&path, test_png()).unwrap();
+            let (base, _requests) = mock_server(response);
+            let client = MailboxClient::new(base, "secret", "kobo").unwrap();
+            assert!(client.fetch_history_image(HistoryKind::Message, 1, HistoryImageSide::Output, &path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), test_png());
+            assert!(!path.with_extension("png.part").exists());
+        }
+        let cache = HistoryCache::new(&dir);
+        fs::create_dir_all(&cache.root).unwrap();
+        let cached = cache.image_path(HistoryKind::Message, 1, HistoryImageSide::Output);
+        for size in [0, MAX_REFINED_IMAGE_BYTES + 1] {
+            let mut file = fs::File::create(&cached).unwrap();
+            if size > 0 {
+                file.write_all(&test_png()).unwrap();
+            }
+            file.set_len(size).unwrap();
+            assert!(!cached_png_valid(&cached));
+            let (base, requests) =
+                mock_server(history_response(&test_png(), "Content-Type: image/png\r\n"));
+            let client = MailboxClient::new(base, "secret", "kobo").unwrap();
+            assert_eq!(
+                cache
+                    .fetch_image(&client, HistoryKind::Message, 1, HistoryImageSide::Output)
+                    .unwrap(),
+                cached
+            );
+            requests.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(cached_png_valid(&cached));
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }

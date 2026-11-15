@@ -246,6 +246,37 @@ class MailboxStore:
         path = self.data_dir / row["image_path"]
         return path if path.is_file() else None
 
+    def history_page(self, limit, cursor):
+        bindings = []
+        where = ""
+        if cursor is not None:
+            sort_time, kind_rank, message_id = cursor
+            where = """WHERE (sort_time < ? OR (sort_time = ? AND
+                (kind_rank < ? OR (kind_rank = ? AND id < ?))))"""
+            bindings = [sort_time, sort_time, kind_rank, kind_rank, message_id]
+        with self._connect() as connection:
+            rows = connection.execute(f"""
+                SELECT * FROM (
+                    SELECT m.id, m.created_at, 2 AS kind_rank,
+                      CASE WHEN m.created_at GLOB
+                        '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'
+                        THEN m.created_at ELSE '0000-00-00T00:00:00Z' END AS sort_time,
+                      CASE WHEN r.id IS NOT NULL THEN 1 ELSE 0 END AS has_reply
+                    FROM messages AS m LEFT JOIN replies AS r ON r.message_id = m.id
+                ) {where}
+                ORDER BY sort_time DESC, kind_rank DESC, id DESC LIMIT ?
+            """, [*bindings, limit + 1]).fetchall()
+        next_cursor = None
+        if len(rows) > limit:
+            last = rows[limit - 1]
+            next_cursor = f'{last["sort_time"]}|2|{last["id"]}'
+        clean = lambda value: re.sub(r"[\t\r\n]", "", str(value))
+        body = "".join(
+            f'message\t{row["id"]}\t{clean(row["created_at"])}\t0\t{row["has_reply"]}\t\n'
+            for row in rows[:limit]
+        ).encode("utf-8")
+        return body, next_cursor
+
 
 class MailboxHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
@@ -300,6 +331,18 @@ def create_server(host, port, store, device_token, family_token):
                 return
             if parsed.path == "/api/device/replies" and not parsed.fragment:
                 self._handle_reply_poll(parsed)
+                return
+            if parsed.path == "/api/device/history" and not parsed.fragment:
+                self._handle_history(parsed)
+                return
+            history_image = re.fullmatch(r"/api/device/history/messages/([1-9][0-9]*)\.png", parsed.path)
+            if history_image and not parsed.fragment:
+                if not self._device_authorized():
+                    self._unauthorized_device()
+                elif parsed.query or len(history_image[1]) > 16 or int(history_image[1]) > 9007199254740991:
+                    self._plain_error(HTTPStatus.NOT_FOUND, "not found")
+                else:
+                    self._serve_image(int(history_image[1]))
                 return
             if parsed.path == "/" and not parsed.fragment:
                 self._handle_family_index(parsed)
@@ -383,6 +426,34 @@ def create_server(host, port, store, device_token, family_token):
                 "text/plain; charset=utf-8",
             )
 
+        def _handle_history(self, parsed):
+            if not self._device_authorized():
+                self._unauthorized_device()
+                return
+            pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            if (any(key not in ("limit", "cursor") for key, _ in pairs)
+                    or len({key for key, _ in pairs}) != len(pairs)):
+                self._plain_error(HTTPStatus.BAD_REQUEST, "invalid history parameters")
+                return
+            params = dict(pairs)
+            limit_text = params.get("limit", "20")
+            if not re.fullmatch(r"[1-9][0-9]*", limit_text) or len(limit_text) > 2 or int(limit_text) > 50:
+                self._plain_error(HTTPStatus.BAD_REQUEST, "invalid history limit")
+                return
+            cursor = None
+            if "cursor" in params:
+                match = re.fullmatch(
+                    r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)\|([21])\|([1-9][0-9]*)",
+                    params["cursor"],
+                )
+                if not match or len(match[3]) > 16 or int(match[3]) > 9007199254740991:
+                    self._plain_error(HTTPStatus.BAD_REQUEST, "invalid history cursor")
+                    return
+                cursor = (match[1], int(match[2]), int(match[3]))
+            body, next_cursor = store.history_page(int(limit_text), cursor)
+            extra = (("X-Next-Cursor", next_cursor),) if next_cursor else ()
+            self._respond(HTTPStatus.OK, body, "text/tab-separated-values; charset=utf-8", extra_headers=extra)
+
         def _handle_reply_poll(self, parsed):
             if not self._device_authorized():
                 self._unauthorized_device()
@@ -452,6 +523,9 @@ def create_server(host, port, store, device_token, family_token):
             if not self._family_authorized():
                 self._plain_error(HTTPStatus.FORBIDDEN, "forbidden")
                 return
+            self._serve_image(message_id)
+
+        def _serve_image(self, message_id):
             path = store.image_path_for_message(message_id)
             if path is None:
                 self._plain_error(HTTPStatus.NOT_FOUND, "not found")
